@@ -12,6 +12,7 @@ pub fn build(b: *std.Build) void {
 
     // Build options
     const enable_openssl = b.option(bool, "openssl", "Enable OpenSSL TLS support") orelse true;
+    const enable_quiche = b.option(bool, "quiche", "Enable quiche QUIC/HTTP3 support") orelse false;
 
     // Main library module
     const lib_mod = b.addModule("pingora", .{
@@ -55,6 +56,28 @@ pub fn build(b: *std.Build) void {
 
         const tls_test_step = b.step("test-tls", "Run TLS/OpenSSL integration tests");
         tls_test_step.dependOn(&run_tls_tests.step);
+    }
+
+    // Quiche QUIC/HTTP3 tests (separate to allow running without quiche)
+    if (enable_quiche) {
+        const quiche_test_mod = b.addModule("quiche_test", .{
+            .root_source_file = b.path("src/quiche_ffi.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+
+        const quiche_tests = b.addTest(.{
+            .root_module = quiche_test_mod,
+        });
+
+        // Link quiche and its dependencies
+        quiche_tests.linkSystemLibrary("quiche");
+        quiche_tests.linkLibC();
+
+        const run_quiche_tests = b.addRunArtifact(quiche_tests);
+
+        const quiche_test_step = b.step("test-quiche", "Run QUIC/HTTP3 quiche integration tests");
+        quiche_test_step.dependOn(&run_quiche_tests.step);
     }
 
     // Benchmark module

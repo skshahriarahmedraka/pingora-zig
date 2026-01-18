@@ -138,6 +138,7 @@ pub const Algorithm = load_balancer.Algorithm;
 
 // Level 4 modules (depend on Level 0-3)
 pub const cache = @import("cache.zig");
+pub const compression = @import("compression.zig");
 
 // Cache types
 pub const HttpCache = cache.HttpCache;
@@ -148,6 +149,16 @@ pub const CacheMeta = cache.CacheMeta;
 pub const CachedResponse = cache.CachedResponse;
 pub const CacheLookupResult = cache.CacheLookupResult;
 
+// Compression types
+pub const CompressionAlgorithm = compression.Algorithm;
+pub const CompressionLevel = compression.CompressionLevel;
+pub const CompressionStats = compression.CompressionStats;
+pub const ResponseCompressionCtx = compression.ResponseCompressionCtx;
+pub const ResponseDecompressionCtx = compression.ResponseDecompressionCtx;
+pub const isCompressibleContentType = compression.isCompressibleContentType;
+pub const DEFAULT_COMPRESSIBLE_TYPES = compression.DEFAULT_COMPRESSIBLE_TYPES;
+pub const DEFAULT_MIN_SIZE = compression.DEFAULT_MIN_SIZE;
+
 // Level 5 modules (top level) - Proxy Framework
 pub const proxy = @import("proxy.zig");
 
@@ -156,6 +167,11 @@ pub const http2 = @import("http2.zig");
 
 // WebSocket support
 pub const websocket = @import("websocket.zig");
+
+// QUIC and HTTP/3 support
+pub const quic = @import("quic.zig");
+pub const http3 = @import("http3.zig");
+pub const quiche_ffi = @import("quiche_ffi.zig");
 
 // Proxy types
 pub const HttpProxy = proxy.HttpProxy;

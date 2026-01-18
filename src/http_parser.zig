@@ -838,3 +838,301 @@ test "case insensitive header matching" {
     try testing.expectEqual(findContentLength(&headers), 100);
     try testing.expect(isChunkedEncoding(&headers));
 }
+
+// ============================================================================
+// Edge Case Tests - Security and Robustness
+// ============================================================================
+
+test "edge case: request smuggling - multiple content-length headers" {
+    // HTTP request smuggling attempt with multiple Content-Length headers
+    const request = "POST /path HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\nContent-Length: 50\r\n\r\n";
+    var headers: [MAX_HEADERS]HeaderRef = undefined;
+
+    const parsed = try parseRequestFull(request, &headers);
+    try testing.expect(parsed != null);
+    // Should find first content-length (behavior may vary - important to document)
+    try testing.expectEqual(findContentLength(parsed.?.headers), 10);
+}
+
+test "edge case: chunked with trailing whitespace" {
+    const chunk = "a  \r\n";
+    const header = try parseChunkHeader(chunk);
+    try testing.expect(header != null);
+    try testing.expectEqual(header.?.size, 0xa);
+}
+
+test "edge case: zero-length chunk (terminator)" {
+    const chunk = "0\r\n";
+    const header = try parseChunkHeader(chunk);
+    try testing.expect(header != null);
+    try testing.expectEqual(header.?.size, 0);
+}
+
+test "edge case: empty header value" {
+    const request = "GET / HTTP/1.1\r\nHost: example.com\r\nX-Empty:\r\n\r\n";
+    var headers: [MAX_HEADERS]HeaderRef = undefined;
+
+    const parsed = try parseRequestFull(request, &headers);
+    try testing.expect(parsed != null);
+    // Find X-Empty header
+    var found = false;
+    for (parsed.?.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "X-Empty")) {
+            try testing.expectEqualStrings("", h.value);
+            found = true;
+            break;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "edge case: header value with leading/trailing whitespace" {
+    const request = "GET / HTTP/1.1\r\nHost:   example.com   \r\n\r\n";
+    var headers: [MAX_HEADERS]HeaderRef = undefined;
+
+    const parsed = try parseRequestFull(request, &headers);
+    try testing.expect(parsed != null);
+    // Value should be trimmed
+    for (parsed.?.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "Host")) {
+            try testing.expectEqualStrings("example.com", h.value);
+            break;
+        }
+    }
+}
+
+test "edge case: request with query string" {
+    const request = "GET /search?q=test&page=1 HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    var headers: [MAX_HEADERS]HeaderRef = undefined;
+
+    const parsed = try parseRequestFull(request, &headers);
+    try testing.expect(parsed != null);
+    try testing.expectEqualStrings("/search?q=test&page=1", parsed.?.path);
+}
+
+test "edge case: request with fragment" {
+    const request = "GET /page#section HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    var headers: [MAX_HEADERS]HeaderRef = undefined;
+
+    const parsed = try parseRequestFull(request, &headers);
+    try testing.expect(parsed != null);
+    try testing.expectEqualStrings("/page#section", parsed.?.path);
+}
+
+test "edge case: response with very long reason phrase" {
+    const reason = "A" ** 100;
+    const response = "HTTP/1.1 200 " ++ reason ++ "\r\nContent-Length: 0\r\n\r\n";
+    var headers: [MAX_HEADERS]HeaderRef = undefined;
+
+    const parsed = try parseResponseFull(response, &headers);
+    try testing.expect(parsed != null);
+    try testing.expectEqual(parsed.?.status_code, 200);
+    try testing.expectEqualStrings(reason, parsed.?.reason);
+}
+
+test "edge case: HTTP/1.0 request" {
+    const request = "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n";
+    var headers: [MAX_HEADERS]HeaderRef = undefined;
+
+    const parsed = try parseRequestFull(request, &headers);
+    try testing.expect(parsed != null);
+    try testing.expectEqual(parsed.?.version, 0); // HTTP/1.0
+}
+
+test "edge case: unusual but valid HTTP methods" {
+    const methods = [_][]const u8{ "OPTIONS", "HEAD", "PUT", "DELETE", "TRACE", "CONNECT", "PATCH" };
+    var headers: [MAX_HEADERS]HeaderRef = undefined;
+
+    inline for (methods) |method| {
+        const request = method ++ " / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        const parsed = try parseRequestFull(request, &headers);
+        try testing.expect(parsed != null);
+        try testing.expectEqualStrings(method, parsed.?.method);
+    }
+}
+
+test "edge case: status codes - informational (1xx)" {
+    const response = "HTTP/1.1 100 Continue\r\n\r\n";
+    var headers: [MAX_HEADERS]HeaderRef = undefined;
+
+    const parsed = try parseResponseFull(response, &headers);
+    try testing.expect(parsed != null);
+    try testing.expectEqual(parsed.?.status_code, 100);
+}
+
+test "edge case: status codes - redirect (3xx)" {
+    const response = "HTTP/1.1 301 Moved Permanently\r\nLocation: https://example.com/new\r\n\r\n";
+    var headers: [MAX_HEADERS]HeaderRef = undefined;
+
+    const parsed = try parseResponseFull(response, &headers);
+    try testing.expect(parsed != null);
+    try testing.expectEqual(parsed.?.status_code, 301);
+}
+
+test "edge case: status codes - client error (4xx)" {
+    const response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+    var headers: [MAX_HEADERS]HeaderRef = undefined;
+
+    const parsed = try parseResponseFull(response, &headers);
+    try testing.expect(parsed != null);
+    try testing.expectEqual(parsed.?.status_code, 404);
+}
+
+test "edge case: status codes - server error (5xx)" {
+    const response = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 120\r\n\r\n";
+    var headers: [MAX_HEADERS]HeaderRef = undefined;
+
+    const parsed = try parseResponseFull(response, &headers);
+    try testing.expect(parsed != null);
+    try testing.expectEqual(parsed.?.status_code, 503);
+}
+
+test "edge case: chunk with extension parameters" {
+    const chunk = "a;name=value;other=\"quoted\"\r\n";
+    const header = try parseChunkHeader(chunk);
+    try testing.expect(header != null);
+    try testing.expectEqual(header.?.size, 0xa);
+}
+
+test "edge case: maximum header count" {
+    // Build request with many headers
+    var request_buf: [8192]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&request_buf);
+    const writer = fbs.writer();
+
+    writer.writeAll("GET / HTTP/1.1\r\n") catch unreachable;
+    for (0..MAX_HEADERS - 1) |i| {
+        writer.print("X-Header-{d}: value{d}\r\n", .{ i, i }) catch break;
+    }
+    writer.writeAll("\r\n") catch unreachable;
+
+    var headers: [MAX_HEADERS]HeaderRef = undefined;
+    const result = parseRequestFull(fbs.getWritten(), &headers);
+    // Should either succeed or fail gracefully with TooManyHeaders
+    if (result) |parsed| {
+        try testing.expect(parsed != null);
+    } else |err| {
+        try testing.expectEqual(err, ParseError.TooManyHeaders);
+    }
+}
+
+test "edge case: partial request line" {
+    var headers: [MAX_HEADERS]HeaderRef = undefined;
+
+    // Just method
+    try testing.expectEqual(parseRequest("GET", &headers), .partial);
+    // Method and space
+    try testing.expectEqual(parseRequest("GET ", &headers), .partial);
+    // Method, path, no version
+    try testing.expectEqual(parseRequest("GET /path", &headers), .partial);
+    // No CRLF at end
+    try testing.expectEqual(parseRequest("GET /path HTTP/1.1", &headers), .partial);
+    // Partial CRLF
+    try testing.expectEqual(parseRequest("GET /path HTTP/1.1\r", &headers), .partial);
+}
+
+test "edge case: partial headers" {
+    var headers: [MAX_HEADERS]HeaderRef = undefined;
+
+    // Request line complete, headers incomplete
+    try testing.expectEqual(parseRequest("GET / HTTP/1.1\r\n", &headers), .partial);
+    try testing.expectEqual(parseRequest("GET / HTTP/1.1\r\nHost:", &headers), .partial);
+    try testing.expectEqual(parseRequest("GET / HTTP/1.1\r\nHost: example.com", &headers), .partial);
+    try testing.expectEqual(parseRequest("GET / HTTP/1.1\r\nHost: example.com\r\n", &headers), .partial);
+}
+
+test "edge case: content-length with leading zeros" {
+    var headers = [_]HeaderRef{
+        .{ .name = "Content-Length", .value = "00100" },
+    };
+    try testing.expectEqual(findContentLength(&headers), 100);
+}
+
+test "edge case: content-length with plus sign" {
+    var headers = [_]HeaderRef{
+        .{ .name = "Content-Length", .value = "+100" },
+    };
+    // Should handle gracefully (may return null or parse)
+    _ = findContentLength(&headers);
+}
+
+test "edge case: invalid content-length (negative)" {
+    var headers = [_]HeaderRef{
+        .{ .name = "Content-Length", .value = "-100" },
+    };
+    try testing.expectEqual(findContentLength(&headers), null);
+}
+
+test "edge case: invalid content-length (non-numeric)" {
+    var headers = [_]HeaderRef{
+        .{ .name = "Content-Length", .value = "abc" },
+    };
+    try testing.expectEqual(findContentLength(&headers), null);
+}
+
+test "edge case: transfer-encoding with multiple values" {
+    var headers = [_]HeaderRef{
+        .{ .name = "Transfer-Encoding", .value = "gzip, chunked" },
+    };
+    try testing.expect(isChunkedEncoding(&headers));
+}
+
+test "edge case: connection close vs keep-alive precedence" {
+    // When both are present, close should take precedence
+    var headers = [_]HeaderRef{
+        .{ .name = "Connection", .value = "keep-alive, close" },
+    };
+    try testing.expect(isConnectionClose(&headers));
+}
+
+test "edge case: websocket upgrade detection" {
+    const headers = [_]HeaderRef{
+        .{ .name = "Connection", .value = "Upgrade" },
+        .{ .name = "Upgrade", .value = "websocket" },
+    };
+    // Check connection header contains upgrade (case-insensitive)
+    var has_upgrade = false;
+    var has_websocket = false;
+    for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "Connection")) {
+            var lower_buf: [64]u8 = undefined;
+            const lower = std.ascii.lowerString(&lower_buf, h.value);
+            if (std.mem.indexOf(u8, lower, "upgrade") != null) {
+                has_upgrade = true;
+            }
+        }
+        if (std.ascii.eqlIgnoreCase(h.name, "Upgrade")) {
+            if (std.ascii.eqlIgnoreCase(h.value, "websocket")) {
+                has_websocket = true;
+            }
+        }
+    }
+    try testing.expect(has_upgrade);
+    try testing.expect(has_websocket);
+}
+
+test "edge case: h2c upgrade detection" {
+    const headers = [_]HeaderRef{
+        .{ .name = "Connection", .value = "Upgrade, HTTP2-Settings" },
+        .{ .name = "Upgrade", .value = "h2c" },
+    };
+    // Check connection header contains upgrade
+    var has_upgrade = false;
+    var has_h2c = false;
+    for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "Connection")) {
+            var lower_buf: [64]u8 = undefined;
+            const lower = std.ascii.lowerString(&lower_buf, h.value);
+            if (std.mem.indexOf(u8, lower, "upgrade") != null) {
+                has_upgrade = true;
+            }
+        }
+        if (std.ascii.eqlIgnoreCase(h.name, "Upgrade")) {
+            if (std.ascii.eqlIgnoreCase(h.value, "h2c")) {
+                has_h2c = true;
+            }
+        }
+    }
+    try testing.expect(has_upgrade);
+    try testing.expect(has_h2c);
+}

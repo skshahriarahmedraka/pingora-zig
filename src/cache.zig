@@ -1047,3 +1047,798 @@ test "generateVaryKey" {
     try testing.expect(std.mem.indexOf(u8, key.asSlice(), "Accept-Encoding=gzip") != null);
 }
 
+// ============================================================================
+// Cache Lock System - Prevents Thundering Herd
+// ============================================================================
+
+/// Status which the read locks could possibly see
+pub const LockStatus = enum(u8) {
+    /// Waiting for the writer to populate the asset
+    waiting = 0,
+    /// The writer finishes, readers can start
+    done = 1,
+    /// The writer encountered error, such as network issue. A new writer will be elected.
+    transient_error = 2,
+    /// The writer observed that no cache lock is needed (e.g., uncacheable), readers should start
+    /// to fetch independently without a new writer
+    give_up = 3,
+    /// The write lock is dropped without being unlocked
+    dangling = 4,
+    /// Reader has held onto cache locks for too long, give up
+    wait_timeout = 5,
+    /// The lock is held for too long by the writer
+    age_timeout = 6,
+
+    pub fn asStr(self: LockStatus) []const u8 {
+        return switch (self) {
+            .waiting => "waiting",
+            .done => "done",
+            .transient_error => "transient_error",
+            .give_up => "give_up",
+            .dangling => "dangling",
+            .wait_timeout => "wait_timeout",
+            .age_timeout => "age_timeout",
+        };
+    }
+};
+
+/// Core lock state shared between writer and readers
+pub const LockCore = struct {
+    /// When the lock was created (nanoseconds since epoch)
+    lock_start: i128,
+    /// Age timeout in nanoseconds
+    age_timeout_ns: u64,
+    /// Current lock status (atomic)
+    lock_status: std.atomic.Value(u8),
+    /// Number of permits available (atomic) - 0 means locked
+    permits: std.atomic.Value(u32),
+    /// Whether this lock is for a stale writer (revalidation)
+    stale_writer: bool,
+    /// Reference count for shared ownership
+    ref_count: std.atomic.Value(u32),
+    /// Allocator for cleanup
+    allocator: Allocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, timeout_ns: u64, stale_writer: bool) !*Self {
+        const self = try allocator.create(Self);
+        self.* = .{
+            .lock_start = std.time.nanoTimestamp(),
+            .age_timeout_ns = timeout_ns,
+            .lock_status = std.atomic.Value(u8).init(@intFromEnum(LockStatus.waiting)),
+            .permits = std.atomic.Value(u32).init(0),
+            .stale_writer = stale_writer,
+            .ref_count = std.atomic.Value(u32).init(1),
+            .allocator = allocator,
+        };
+        return self;
+    }
+
+    pub fn ref(self: *Self) *Self {
+        _ = self.ref_count.fetchAdd(1, .monotonic);
+        return self;
+    }
+
+    pub fn unref(self: *Self) void {
+        // Use acq_rel ordering to ensure proper synchronization before deallocation
+        if (self.ref_count.fetchSub(1, .acq_rel) == 1) {
+            self.allocator.destroy(self);
+        }
+    }
+
+    pub fn locked(self: *const Self) bool {
+        return self.permits.load(.acquire) == 0;
+    }
+
+    pub fn unlock(self: *Self, reason: LockStatus) void {
+        std.debug.assert(reason != .wait_timeout); // WaitTimeout is not stored in LockCore
+        self.lock_status.store(@intFromEnum(reason), .seq_cst);
+        // Release permits to wake up readers (any positive number works)
+        self.permits.store(10, .release);
+    }
+
+    pub fn lockStatus(self: *const Self) LockStatus {
+        return @enumFromInt(self.lock_status.load(.seq_cst));
+    }
+
+    pub fn isStaleWriter(self: *const Self) bool {
+        return self.stale_writer;
+    }
+
+    /// Check if the lock has expired based on age timeout
+    pub fn expired(self: *const Self) bool {
+        const now = std.time.nanoTimestamp();
+        const elapsed = now - self.lock_start;
+        if (elapsed < 0) return false;
+        return @as(u64, @intCast(elapsed)) >= self.age_timeout_ns;
+    }
+};
+
+/// ReadLock: the requests who get it need to wait until it is released
+pub const ReadLock = struct {
+    core: *LockCore,
+
+    const Self = @This();
+
+    pub fn init(core: *LockCore) Self {
+        return .{ .core = core.ref() };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.core.unref();
+    }
+
+    /// Wait for the writer to release the lock (blocking with timeout)
+    pub fn wait(self: *Self) void {
+        if (!self.locked()) {
+            return;
+        }
+
+        // Check if already expired
+        if (self.core.expired()) {
+            self.core.lock_status.store(@intFromEnum(LockStatus.age_timeout), .seq_cst);
+            return;
+        }
+
+        // Calculate remaining time
+        const now = std.time.nanoTimestamp();
+        const elapsed = now - self.core.lock_start;
+        if (elapsed < 0) return;
+
+        const elapsed_u64: u64 = @intCast(elapsed);
+        if (elapsed_u64 >= self.core.age_timeout_ns) {
+            self.core.lock_status.store(@intFromEnum(LockStatus.age_timeout), .seq_cst);
+            return;
+        }
+
+        const remaining_ns = self.core.age_timeout_ns - elapsed_u64;
+        const sleep_interval_ns: u64 = 1_000_000; // 1ms
+
+        // Poll until unlocked or timeout
+        var waited_ns: u64 = 0;
+        while (waited_ns < remaining_ns) {
+            if (self.core.permits.load(.acquire) > 0) {
+                return; // Lock released
+            }
+            std.time.sleep(sleep_interval_ns);
+            waited_ns += sleep_interval_ns;
+        }
+
+        // Timed out
+        self.core.lock_status.store(@intFromEnum(LockStatus.age_timeout), .seq_cst);
+    }
+
+    /// Test if it is still locked
+    pub fn locked(self: *const Self) bool {
+        return self.core.locked();
+    }
+
+    /// Whether the lock is expired
+    pub fn expired(self: *const Self) bool {
+        return self.core.expired();
+    }
+
+    /// The current status of the lock
+    pub fn lockStatus(self: *const Self) LockStatus {
+        const status = self.core.lockStatus();
+        if (status == .waiting and self.expired()) {
+            return .age_timeout;
+        }
+        return status;
+    }
+};
+
+/// WritePermit: the holder must populate the cache and then release it
+pub const WritePermit = struct {
+    core: *LockCore,
+    finished: bool,
+
+    const Self = @This();
+
+    pub fn init(core: *LockCore) Self {
+        return .{
+            .core = core.ref(),
+            .finished = false,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        // Writer exited without properly unlocking - let others compete again
+        if (!self.finished) {
+            self.unlock(.dangling);
+        }
+        self.core.unref();
+    }
+
+    /// Was this lock for a stale cache fetch writer?
+    pub fn staleWriter(self: *const Self) bool {
+        return self.core.isStaleWriter();
+    }
+
+    pub fn unlock(self: *Self, reason: LockStatus) void {
+        self.finished = true;
+        self.core.unlock(reason);
+    }
+
+    pub fn lockStatus(self: *const Self) LockStatus {
+        return self.core.lockStatus();
+    }
+};
+
+/// A struct representing locked cache access
+pub const Locked = union(enum) {
+    /// The writer is allowed to fetch the asset
+    write: WritePermit,
+    /// The reader waits for the writer to fetch the asset
+    read: ReadLock,
+
+    pub fn isWrite(self: Locked) bool {
+        return self == .write;
+    }
+
+    pub fn deinit(self: *Locked) void {
+        switch (self.*) {
+            .write => |*w| w.deinit(),
+            .read => |*r| r.deinit(),
+        }
+    }
+};
+
+/// Internal lock stub stored in the lock table
+const LockStub = struct {
+    core: *LockCore,
+
+    pub fn readLock(self: *const LockStub) ReadLock {
+        return ReadLock.init(self.core);
+    }
+
+    pub fn deinit(self: *LockStub) void {
+        self.core.unref();
+    }
+};
+
+/// The global cache locking manager - prevents thundering herd on cache misses
+pub const CacheLock = struct {
+    /// Lock table mapping cache key hashes to lock stubs
+    lock_table: std.AutoHashMap(u128, LockStub),
+    /// Mutex for thread-safe access
+    mutex: std.Thread.Mutex,
+    /// Age timeout for locks (nanoseconds)
+    age_timeout_ns: u64,
+    /// Allocator
+    allocator: Allocator,
+
+    const Self = @This();
+
+    /// Create a new CacheLock with the given age timeout in seconds
+    pub fn init(allocator: Allocator, age_timeout_seconds: u64) Self {
+        return .{
+            .lock_table = std.AutoHashMap(u128, LockStub).init(allocator),
+            .mutex = .{},
+            .age_timeout_ns = age_timeout_seconds * std.time.ns_per_s,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        var iter = self.lock_table.valueIterator();
+        while (iter.next()) |stub| {
+            var s = stub.*;
+            s.deinit();
+        }
+        self.lock_table.deinit();
+    }
+
+    /// Try to lock a cache fetch
+    ///
+    /// If `stale_writer` is true, this fetch is to revalidate an asset already in cache.
+    /// Users should call after a cache miss before fetching the asset.
+    /// The returned Locked will tell the caller either to fetch (write) or wait (read).
+    pub fn lock(self: *Self, key: *const CacheKey, stale_writer: bool) !Locked {
+        const hash = keyToU128(key);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Check if there's an existing lock
+        if (self.lock_table.get(hash)) |stub| {
+            const status = stub.core.lockStatus();
+            // If the lock is dangling or timed out, allow replacing it
+            if (status != .dangling and status != .age_timeout) {
+                return .{ .read = stub.readLock() };
+            }
+            // Fall through to create new lock
+        }
+
+        // Create a new lock - this request becomes the writer
+        const core = try LockCore.init(self.allocator, self.age_timeout_ns, stale_writer);
+        errdefer core.unref();
+
+        const stub = LockStub{ .core = core.ref() };
+
+        // Remove old entry if exists and insert new one
+        if (self.lock_table.fetchRemove(hash)) |old| {
+            var old_stub = old.value;
+            old_stub.deinit();
+        }
+        try self.lock_table.put(hash, stub);
+
+        return .{ .write = WritePermit.init(core) };
+    }
+
+    /// Release a lock for the given key
+    pub fn release(self: *Self, key: *const CacheKey, permit: *WritePermit, reason: LockStatus) void {
+        const hash = keyToU128(key);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (permit.core.lockStatus() == .age_timeout) {
+            // If lock age timed out, readers can replace the lock
+            // Keep the lock status as timeout when unlocking
+            permit.unlock(.age_timeout);
+        } else if (self.lock_table.fetchRemove(hash)) |removed| {
+            var stub = removed.value;
+            permit.unlock(reason);
+            stub.deinit();
+        }
+    }
+
+    /// Convert a CacheKey to u128 hash for the lock table
+    fn keyToU128(key: *const CacheKey) u128 {
+        const h64 = std.hash.Wyhash.hash(0, key.key);
+        const h64_2 = std.hash.Wyhash.hash(h64, key.key);
+        return (@as(u128, h64) << 64) | @as(u128, h64_2);
+    }
+};
+
+// ============================================================================
+// Cache Lock Tests
+// ============================================================================
+
+test "LockStatus conversion" {
+    try testing.expectEqual(LockStatus.waiting, @as(LockStatus, @enumFromInt(0)));
+    try testing.expectEqual(LockStatus.done, @as(LockStatus, @enumFromInt(1)));
+    try testing.expectEqualStrings("waiting", LockStatus.waiting.asStr());
+    try testing.expectEqualStrings("done", LockStatus.done.asStr());
+}
+
+test "CacheLock basic lock/release" {
+    var cache_lock = CacheLock.init(testing.allocator, 1000);
+    defer cache_lock.deinit();
+
+    var key1 = CacheKey.fromSlice("test:key:1");
+
+    // First lock should be write permit
+    var locked1 = try cache_lock.lock(&key1, false);
+    try testing.expect(locked1.isWrite());
+
+    // Second lock on same key should be read lock
+    var locked2 = try cache_lock.lock(&key1, false);
+    try testing.expect(!locked2.isWrite());
+    locked2.deinit();
+
+    // Release the write lock
+    cache_lock.release(&key1, &locked1.write, .done);
+    locked1.deinit();
+
+    // Now should get write permit again
+    var locked3 = try cache_lock.lock(&key1, false);
+    try testing.expect(locked3.isWrite());
+    cache_lock.release(&key1, &locked3.write, .done);
+    locked3.deinit();
+}
+
+test "CacheLock different keys" {
+    var cache_lock = CacheLock.init(testing.allocator, 1000);
+    defer cache_lock.deinit();
+
+    var key1 = CacheKey.fromSlice("test:key:1");
+    var key2 = CacheKey.fromSlice("test:key:2");
+
+    // Different keys should both get write permits
+    var locked1 = try cache_lock.lock(&key1, false);
+    try testing.expect(locked1.isWrite());
+
+    var locked2 = try cache_lock.lock(&key2, false);
+    try testing.expect(locked2.isWrite());
+
+    cache_lock.release(&key1, &locked1.write, .done);
+    cache_lock.release(&key2, &locked2.write, .done);
+    locked1.deinit();
+    locked2.deinit();
+}
+
+test "CacheLock stale writer flag" {
+    var cache_lock = CacheLock.init(testing.allocator, 1000);
+    defer cache_lock.deinit();
+
+    var key = CacheKey.fromSlice("test:key");
+
+    var locked = try cache_lock.lock(&key, true);
+    try testing.expect(locked.isWrite());
+    try testing.expect(locked.write.staleWriter());
+
+    cache_lock.release(&key, &locked.write, .done);
+    locked.deinit();
+}
+
+test "ReadLock status" {
+    var cache_lock = CacheLock.init(testing.allocator, 1000);
+    defer cache_lock.deinit();
+
+    var key = CacheKey.fromSlice("test:key");
+
+    var write_locked = try cache_lock.lock(&key, false);
+    var read_locked = try cache_lock.lock(&key, false);
+
+    try testing.expect(read_locked.read.locked());
+    try testing.expectEqual(LockStatus.waiting, read_locked.read.lockStatus());
+
+    // Unlock the write permit
+    cache_lock.release(&key, &write_locked.write, .done);
+
+    // Read lock should now see done status
+    try testing.expect(!read_locked.read.locked());
+    try testing.expectEqual(LockStatus.done, read_locked.read.lockStatus());
+
+    write_locked.deinit();
+    read_locked.deinit();
+}
+
+test "WritePermit dangling on drop without unlock" {
+    var cache_lock = CacheLock.init(testing.allocator, 1000);
+    defer cache_lock.deinit();
+
+    var key = CacheKey.fromSlice("test:key");
+
+    // Get write permit but don't release properly
+    {
+        var locked = try cache_lock.lock(&key, false);
+        // locked goes out of scope without calling release
+        // This should set status to dangling
+        locked.deinit();
+    }
+
+    // New request should be able to get write permit (dangling lock replaced)
+    var locked2 = try cache_lock.lock(&key, false);
+    try testing.expect(locked2.isWrite());
+    cache_lock.release(&key, &locked2.write, .done);
+    locked2.deinit();
+}
+
+// ============================================================================
+// Cache Predictor - Remembers Uncacheable Assets
+// ============================================================================
+
+/// Reasons why a response was not cached
+pub const NoCacheReason = union(enum) {
+    /// Caching was never enabled for this request
+    never_enabled,
+    /// Storage backend error
+    storage_error,
+    /// Internal error during caching
+    internal_error,
+    /// Caching was deferred
+    deferred,
+    /// Cache lock was given up
+    cache_lock_give_up,
+    /// Cache lock timed out
+    cache_lock_timeout,
+    /// Request was declined and sent to upstream
+    declined_to_upstream,
+    /// Upstream returned an error
+    upstream_error,
+    /// Origin explicitly said not to cache (Cache-Control: no-store, private, etc.)
+    origin_not_cache,
+    /// Response was too large to cache
+    response_too_large,
+    /// Predicted response would be too large
+    predicted_response_too_large,
+    /// Custom reason with a description
+    custom: []const u8,
+
+    pub fn shouldRemember(self: NoCacheReason) bool {
+        // Only remember certain reasons that indicate the asset is truly uncacheable
+        return switch (self) {
+            // These are transient errors - don't remember
+            .never_enabled,
+            .storage_error,
+            .internal_error,
+            .deferred,
+            .cache_lock_give_up,
+            .cache_lock_timeout,
+            .declined_to_upstream,
+            .upstream_error,
+            .predicted_response_too_large,
+            => false,
+            // These indicate the origin doesn't want caching - remember these
+            .origin_not_cache,
+            .response_too_large,
+            .custom,
+            => true,
+        };
+    }
+
+    pub fn asStr(self: NoCacheReason) []const u8 {
+        return switch (self) {
+            .never_enabled => "never_enabled",
+            .storage_error => "storage_error",
+            .internal_error => "internal_error",
+            .deferred => "deferred",
+            .cache_lock_give_up => "cache_lock_give_up",
+            .cache_lock_timeout => "cache_lock_timeout",
+            .declined_to_upstream => "declined_to_upstream",
+            .upstream_error => "upstream_error",
+            .origin_not_cache => "origin_not_cache",
+            .response_too_large => "response_too_large",
+            .predicted_response_too_large => "predicted_response_too_large",
+            .custom => |reason| reason,
+        };
+    }
+};
+
+/// Custom reason predicate function type
+pub const CustomReasonPredicate = *const fn ([]const u8) bool;
+
+/// Cacheability Predictor
+///
+/// Remembers previously uncacheable assets.
+/// Allows bypassing cache / cache lock early based on historical precedent.
+///
+/// NOTE: to simply avoid caching requests with certain characteristics,
+/// add checks in request_cache_filter to avoid enabling cache in the first place.
+/// The predictor's bypass mechanism handles cases where the request _looks_ cacheable
+/// but its previous responses suggest otherwise.
+pub const CachePredictor = struct {
+    /// LRU cache of uncacheable key hashes (using hash map + linked list for LRU behavior)
+    uncacheable_keys: std.AutoHashMap(u128, void),
+    /// Order of keys for LRU eviction (oldest first)
+    key_order: std.ArrayListUnmanaged(u128),
+    /// Maximum capacity
+    capacity: usize,
+    /// Optional predicate to skip certain custom reasons
+    skip_custom_reasons_fn: ?CustomReasonPredicate,
+    /// Mutex for thread-safe access
+    mutex: std.Thread.Mutex,
+    /// Allocator
+    allocator: Allocator,
+
+    const Self = @This();
+
+    /// Create a new CachePredictor with the given capacity
+    ///
+    /// - `capacity`: number of uncacheable keys to remember
+    /// - `skip_custom_reasons_fn`: optional predicate that returns true if a custom
+    ///   reason should be skipped (not remembered as uncacheable)
+    pub fn init(
+        allocator: Allocator,
+        capacity: usize,
+        skip_custom_reasons_fn: ?CustomReasonPredicate,
+    ) !Self {
+        return .{
+            .uncacheable_keys = std.AutoHashMap(u128, void).init(allocator),
+            .key_order = .{},
+            .capacity = capacity,
+            .skip_custom_reasons_fn = skip_custom_reasons_fn,
+            .mutex = .{},
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.uncacheable_keys.deinit();
+        self.key_order.deinit(self.allocator);
+    }
+
+    /// Return true if likely cacheable, false if likely not.
+    /// Based on historical data about previous requests to this key.
+    pub fn cacheablePrediction(self: *Self, key: *const CacheKey) bool {
+        const hash = keyToU128(key);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // If key is in uncacheable list, predict not cacheable
+        return !self.uncacheable_keys.contains(hash);
+    }
+
+    /// Mark a key as cacheable (remove from uncacheable list).
+    /// Returns false if the key was already marked cacheable (not in list).
+    pub fn markCacheable(self: *Self, key: *const CacheKey) bool {
+        const hash = keyToU128(key);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Check if in uncacheable list
+        if (!self.uncacheable_keys.contains(hash)) {
+            // Not in uncacheable list, nothing to do
+            return true;
+        }
+
+        // Remove from uncacheable list
+        _ = self.uncacheable_keys.remove(hash);
+        // Remove from order list
+        for (self.key_order.items, 0..) |k, i| {
+            if (k == hash) {
+                _ = self.key_order.orderedRemove(i);
+                break;
+            }
+        }
+        return false;
+    }
+
+    /// Mark a key as uncacheable.
+    /// May skip marking on certain NoCacheReasons.
+    /// Returns null if we skipped marking uncacheable.
+    /// Returns false if the key was already marked uncacheable.
+    /// Returns true if newly marked uncacheable.
+    pub fn markUncacheable(self: *Self, key: *const CacheKey, reason: NoCacheReason) ?bool {
+        // Check if we should remember this reason
+        if (!reason.shouldRemember()) {
+            return null;
+        }
+
+        // Check custom reason predicate
+        if (reason == .custom) {
+            if (self.skip_custom_reasons_fn) |predicate| {
+                if (predicate(reason.custom)) {
+                    return null; // Skip this custom reason
+                }
+            }
+        }
+
+        const hash = keyToU128(key);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Check if already in uncacheable list
+        if (self.uncacheable_keys.contains(hash)) {
+            // Already marked uncacheable, but update LRU position (move to end)
+            for (self.key_order.items, 0..) |k, i| {
+                if (k == hash) {
+                    _ = self.key_order.orderedRemove(i);
+                    break;
+                }
+            }
+            self.key_order.append(self.allocator, hash) catch return false;
+            return false;
+        }
+
+        // Evict oldest if at capacity
+        if (self.key_order.items.len >= self.capacity) {
+            if (self.key_order.items.len > 0) {
+                const oldest = self.key_order.orderedRemove(0);
+                _ = self.uncacheable_keys.remove(oldest);
+            }
+        }
+
+        // Add to uncacheable list
+        self.uncacheable_keys.put(hash, {}) catch return null;
+        self.key_order.append(self.allocator, hash) catch {
+            _ = self.uncacheable_keys.remove(hash);
+            return null;
+        };
+        return true;
+    }
+
+    /// Convert a CacheKey to u128 hash
+    fn keyToU128(key: *const CacheKey) u128 {
+        const h64 = std.hash.Wyhash.hash(0, key.key);
+        const h64_2 = std.hash.Wyhash.hash(h64, key.key);
+        return (@as(u128, h64) << 64) | @as(u128, h64_2);
+    }
+};
+
+// ============================================================================
+// Cache Predictor Tests
+// ============================================================================
+
+test "NoCacheReason shouldRemember" {
+    // Transient errors should not be remembered
+    const internal_error: NoCacheReason = .internal_error;
+    const storage_error: NoCacheReason = .storage_error;
+    const cache_lock_timeout: NoCacheReason = .cache_lock_timeout;
+    try testing.expect(!internal_error.shouldRemember());
+    try testing.expect(!storage_error.shouldRemember());
+    try testing.expect(!cache_lock_timeout.shouldRemember());
+
+    // Origin decisions should be remembered
+    const origin_not_cache: NoCacheReason = .origin_not_cache;
+    const response_too_large: NoCacheReason = .response_too_large;
+    const custom: NoCacheReason = .{ .custom = "test" };
+    try testing.expect(origin_not_cache.shouldRemember());
+    try testing.expect(response_too_large.shouldRemember());
+    try testing.expect(custom.shouldRemember());
+}
+
+test "CachePredictor basic cacheability" {
+    var predictor = try CachePredictor.init(testing.allocator, 10, null);
+    defer predictor.deinit();
+
+    var key = CacheKey.fromSlice("a:b:c");
+
+    // Cacheable if no history
+    try testing.expect(predictor.cacheablePrediction(&key));
+
+    // Don't remember internal / storage errors
+    _ = predictor.markUncacheable(&key, .internal_error);
+    try testing.expect(predictor.cacheablePrediction(&key));
+    _ = predictor.markUncacheable(&key, .storage_error);
+    try testing.expect(predictor.cacheablePrediction(&key));
+
+    // Origin explicitly said uncacheable
+    _ = predictor.markUncacheable(&key, .origin_not_cache);
+    try testing.expect(!predictor.cacheablePrediction(&key));
+
+    // Mark cacheable again
+    _ = predictor.markCacheable(&key);
+    try testing.expect(predictor.cacheablePrediction(&key));
+}
+
+test "CachePredictor custom skip predicate" {
+    const skipFn = struct {
+        fn predicate(reason: []const u8) bool {
+            return std.mem.eql(u8, reason, "Skipping");
+        }
+    }.predicate;
+
+    var predictor = try CachePredictor.init(testing.allocator, 10, skipFn);
+    defer predictor.deinit();
+
+    var key1 = CacheKey.fromSlice("a:b:c");
+
+    // Cacheable if no history
+    try testing.expect(predictor.cacheablePrediction(&key1));
+
+    // Custom predicate still uses default skip reasons
+    _ = predictor.markUncacheable(&key1, .internal_error);
+    try testing.expect(predictor.cacheablePrediction(&key1));
+
+    // Other custom reasons can still be marked uncacheable
+    _ = predictor.markUncacheable(&key1, .{ .custom = "DontCacheMe" });
+    try testing.expect(!predictor.cacheablePrediction(&key1));
+
+    var key2 = CacheKey.fromSlice("a:c:d");
+    try testing.expect(predictor.cacheablePrediction(&key2));
+
+    // Specific custom reason is skipped
+    _ = predictor.markUncacheable(&key2, .{ .custom = "Skipping" });
+    try testing.expect(predictor.cacheablePrediction(&key2));
+}
+
+test "CachePredictor LRU eviction" {
+    var predictor = try CachePredictor.init(testing.allocator, 3, null);
+    defer predictor.deinit();
+
+    var key1 = CacheKey.fromSlice("a:b:c");
+    _ = predictor.markUncacheable(&key1, .origin_not_cache);
+    try testing.expect(!predictor.cacheablePrediction(&key1));
+
+    var key2 = CacheKey.fromSlice("a:bc:c");
+    _ = predictor.markUncacheable(&key2, .origin_not_cache);
+    try testing.expect(!predictor.cacheablePrediction(&key2));
+
+    var key3 = CacheKey.fromSlice("a:cd:c");
+    _ = predictor.markUncacheable(&key3, .origin_not_cache);
+    try testing.expect(!predictor.cacheablePrediction(&key3));
+
+    // Promote / reinsert key1
+    _ = predictor.markUncacheable(&key1, .origin_not_cache);
+
+    var key4 = CacheKey.fromSlice("a:de:c");
+    _ = predictor.markUncacheable(&key4, .origin_not_cache);
+    try testing.expect(!predictor.cacheablePrediction(&key4));
+
+    // key1 was recently used, should still be there
+    try testing.expect(!predictor.cacheablePrediction(&key1));
+    // key2 was evicted (LRU)
+    try testing.expect(predictor.cacheablePrediction(&key2));
+    // key3 and key4 should still be there
+    try testing.expect(!predictor.cacheablePrediction(&key3));
+    try testing.expect(!predictor.cacheablePrediction(&key4));
+}
+

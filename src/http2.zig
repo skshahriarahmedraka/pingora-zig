@@ -2196,6 +2196,94 @@ pub const FrameBuilder = struct {
 
         return FRAME_HEADER_SIZE + header_block.len;
     }
+
+    /// Build a PUSH_PROMISE frame (RFC 7540 Section 6.6)
+    /// Used by servers to initiate server push
+    /// stream_id: The stream ID of the request that triggered the push
+    /// promised_stream_id: The stream ID for the pushed response
+    /// header_block: HPACK-encoded headers for the promised request
+    pub fn buildPushPromise(
+        stream_id: u31,
+        promised_stream_id: u31,
+        header_block: []const u8,
+        end_headers: bool,
+        buf: []u8,
+    ) !usize {
+        const payload_len = 4 + header_block.len; // 4 bytes for promised stream ID
+        if (buf.len < FRAME_HEADER_SIZE + payload_len) return error.BufferTooSmall;
+
+        var flags = FrameFlags{};
+        if (end_headers) flags.end_headers = true;
+
+        const header = FrameHeader{
+            .length = @intCast(payload_len),
+            .frame_type = .push_promise,
+            .flags = flags,
+            .stream_id = stream_id,
+        };
+        header.serialize(buf[0..FRAME_HEADER_SIZE]);
+
+        // Promised Stream ID (4 bytes, with R bit reserved)
+        const pid: u32 = promised_stream_id;
+        buf[FRAME_HEADER_SIZE] = @truncate((pid >> 24) & 0x7F); // R bit must be 0
+        buf[FRAME_HEADER_SIZE + 1] = @truncate(pid >> 16);
+        buf[FRAME_HEADER_SIZE + 2] = @truncate(pid >> 8);
+        buf[FRAME_HEADER_SIZE + 3] = @truncate(pid);
+
+        // Header block fragment
+        @memcpy(buf[FRAME_HEADER_SIZE + 4 ..][0..header_block.len], header_block);
+
+        return FRAME_HEADER_SIZE + payload_len;
+    }
+
+    /// Build a PUSH_PROMISE frame with padding support
+    pub fn buildPushPromisePadded(
+        stream_id: u31,
+        promised_stream_id: u31,
+        header_block: []const u8,
+        end_headers: bool,
+        padding_len: u8,
+        buf: []u8,
+    ) !usize {
+        const payload_len = 1 + 4 + header_block.len + padding_len; // pad length + promised ID + headers + padding
+        if (buf.len < FRAME_HEADER_SIZE + payload_len) return error.BufferTooSmall;
+
+        var flags = FrameFlags{};
+        if (end_headers) flags.end_headers = true;
+        flags.padded = true;
+
+        const header = FrameHeader{
+            .length = @intCast(payload_len),
+            .frame_type = .push_promise,
+            .flags = flags,
+            .stream_id = stream_id,
+        };
+        header.serialize(buf[0..FRAME_HEADER_SIZE]);
+
+        var offset: usize = FRAME_HEADER_SIZE;
+
+        // Pad Length (1 byte)
+        buf[offset] = padding_len;
+        offset += 1;
+
+        // Promised Stream ID (4 bytes)
+        const pid: u32 = promised_stream_id;
+        buf[offset] = @truncate((pid >> 24) & 0x7F);
+        buf[offset + 1] = @truncate(pid >> 16);
+        buf[offset + 2] = @truncate(pid >> 8);
+        buf[offset + 3] = @truncate(pid);
+        offset += 4;
+
+        // Header block fragment
+        @memcpy(buf[offset..][0..header_block.len], header_block);
+        offset += header_block.len;
+
+        // Padding (zeros)
+        @memset(buf[offset..][0..padding_len], 0);
+        offset += padding_len;
+
+        return offset;
+    }
 };
 
 // ============================================================================
@@ -3175,4 +3263,394 @@ test "FrameBuilder buffer too small" {
     try testing.expectError(error.BufferTooSmall, FrameBuilder.buildHeaders(1, "data", true, true, null, &small_buf));
     try testing.expectError(error.BufferTooSmall, FrameBuilder.buildData(1, "data", true, &small_buf));
     try testing.expectError(error.BufferTooSmall, FrameBuilder.buildContinuation(1, "data", true, &small_buf));
+    try testing.expectError(error.BufferTooSmall, FrameBuilder.buildPushPromise(1, 2, "data", true, &small_buf));
+}
+
+test "FrameBuilder buildPushPromise" {
+    var buf: [256]u8 = undefined;
+    const header_block = "test-header-block";
+
+    const len = try FrameBuilder.buildPushPromise(1, 2, header_block, true, &buf);
+
+    // Parse and verify the frame header
+    const header = FrameHeader.parse(buf[0..FRAME_HEADER_SIZE]).?;
+    try testing.expectEqual(header.frame_type, .push_promise);
+    try testing.expectEqual(header.stream_id, 1);
+    try testing.expect(header.flags.hasEndHeaders());
+    try testing.expectEqual(header.length, 4 + header_block.len); // 4 bytes for promised stream ID
+
+    // Verify promised stream ID
+    const promised_id: u32 = (@as(u32, buf[FRAME_HEADER_SIZE] & 0x7F) << 24) |
+        (@as(u32, buf[FRAME_HEADER_SIZE + 1]) << 16) |
+        (@as(u32, buf[FRAME_HEADER_SIZE + 2]) << 8) |
+        buf[FRAME_HEADER_SIZE + 3];
+    try testing.expectEqual(promised_id, 2);
+
+    // Verify header block
+    try testing.expectEqualStrings(header_block, buf[FRAME_HEADER_SIZE + 4 ..][0..header_block.len]);
+
+    // Total length check
+    try testing.expectEqual(len, FRAME_HEADER_SIZE + 4 + header_block.len);
+}
+
+test "FrameBuilder buildPushPromise without END_HEADERS" {
+    var buf: [256]u8 = undefined;
+    const header_block = "partial-headers";
+
+    const len = try FrameBuilder.buildPushPromise(3, 4, header_block, false, &buf);
+
+    const header = FrameHeader.parse(buf[0..FRAME_HEADER_SIZE]).?;
+    try testing.expectEqual(header.frame_type, .push_promise);
+    try testing.expectEqual(header.stream_id, 3);
+    try testing.expect(!header.flags.hasEndHeaders());
+
+    // Verify promised stream ID
+    const promised_id: u32 = (@as(u32, buf[FRAME_HEADER_SIZE] & 0x7F) << 24) |
+        (@as(u32, buf[FRAME_HEADER_SIZE + 1]) << 16) |
+        (@as(u32, buf[FRAME_HEADER_SIZE + 2]) << 8) |
+        buf[FRAME_HEADER_SIZE + 3];
+    try testing.expectEqual(promised_id, 4);
+
+    try testing.expectEqual(len, FRAME_HEADER_SIZE + 4 + header_block.len);
+}
+
+test "FrameBuilder buildPushPromisePadded" {
+    var buf: [256]u8 = undefined;
+    const header_block = "test-headers";
+    const padding_len: u8 = 10;
+
+    const len = try FrameBuilder.buildPushPromisePadded(1, 2, header_block, true, padding_len, &buf);
+
+    const header = FrameHeader.parse(buf[0..FRAME_HEADER_SIZE]).?;
+    try testing.expectEqual(header.frame_type, .push_promise);
+    try testing.expectEqual(header.stream_id, 1);
+    try testing.expect(header.flags.hasEndHeaders());
+    try testing.expect(header.flags.hasPadded());
+
+    // Verify pad length byte
+    try testing.expectEqual(buf[FRAME_HEADER_SIZE], padding_len);
+
+    // Verify promised stream ID (after pad length)
+    const promised_id: u32 = (@as(u32, buf[FRAME_HEADER_SIZE + 1] & 0x7F) << 24) |
+        (@as(u32, buf[FRAME_HEADER_SIZE + 2]) << 16) |
+        (@as(u32, buf[FRAME_HEADER_SIZE + 3]) << 8) |
+        buf[FRAME_HEADER_SIZE + 4];
+    try testing.expectEqual(promised_id, 2);
+
+    // Verify header block (after pad length + promised ID)
+    try testing.expectEqualStrings(header_block, buf[FRAME_HEADER_SIZE + 5 ..][0..header_block.len]);
+
+    // Verify padding is zeros
+    const padding_start = FRAME_HEADER_SIZE + 5 + header_block.len;
+    for (buf[padding_start..][0..padding_len]) |byte| {
+        try testing.expectEqual(byte, 0);
+    }
+
+    // Total length: header + pad_len(1) + promised_id(4) + headers + padding
+    try testing.expectEqual(len, FRAME_HEADER_SIZE + 1 + 4 + header_block.len + padding_len);
+}
+
+// ============================================================================
+// Edge Case Tests - HTTP/2 HPACK and Protocol
+// ============================================================================
+
+test "edge case: HPACK static table boundary indices" {
+    // Test index 1 (first entry: :authority)
+    const entry1 = StaticTable.get(1);
+    try testing.expect(entry1 != null);
+    try testing.expectEqualStrings(":authority", entry1.?.name);
+
+    // Test index 61 (last entry: www-authenticate)
+    const entry61 = StaticTable.get(61);
+    try testing.expect(entry61 != null);
+    try testing.expectEqualStrings("www-authenticate", entry61.?.name);
+
+    // Test index 0 (invalid)
+    try testing.expectEqual(StaticTable.get(0), null);
+
+    // Test index 62 (out of bounds for static table)
+    try testing.expectEqual(StaticTable.get(62), null);
+}
+
+test "edge case: HPACK dynamic table size update" {
+    var table = DynamicTable.init(testing.allocator, 4096);
+    defer table.deinit();
+
+    // Add entries
+    try table.add("custom-header", "value1");
+    try table.add("another-header", "value2");
+    try testing.expectEqual(table.entries.items.len, 2);
+
+    // Resize to 0 should evict all entries
+    table.setMaxSize(0);
+    try testing.expectEqual(table.entries.items.len, 0);
+
+    // Resize back and add new entry
+    table.setMaxSize(4096);
+    try table.add("new-header", "new-value");
+    try testing.expectEqual(table.entries.items.len, 1);
+}
+
+test "edge case: HPACK integer encoding boundary values" {
+    var buf: [16]u8 = undefined;
+
+    // Encode value that fits in prefix (5-bit prefix, value < 31)
+    const len1 = HpackEncoder.encodeInteger(30, 5, 0, &buf);
+    try testing.expectEqual(len1, 1);
+    try testing.expectEqual(buf[0], 30);
+
+    // Encode value at prefix boundary (5-bit prefix, value = 31)
+    const len2 = HpackEncoder.encodeInteger(31, 5, 0, &buf);
+    try testing.expectEqual(len2, 2);
+    try testing.expectEqual(buf[0], 31);
+    try testing.expectEqual(buf[1], 0);
+
+    // Encode larger value requiring multiple bytes
+    const len3 = HpackEncoder.encodeInteger(1337, 5, 0, &buf);
+    try testing.expect(len3 > 2);
+}
+
+test "edge case: HPACK integer decoding multi-byte" {
+    // Value 1337 encoded with 5-bit prefix: 31, 154, 10
+    const encoded = [_]u8{ 31, 154, 10 };
+    const result = HpackDecoder.decodeInteger(&encoded, 5);
+    try testing.expect(result != null);
+    try testing.expectEqual(result.?.value, 1337);
+    try testing.expectEqual(result.?.consumed, 3);
+}
+
+test "edge case: Huffman encoding empty string" {
+    var buf: [16]u8 = undefined;
+    const len = HuffmanEncoder.encode("", &buf);
+    try testing.expectEqual(len, 0);
+}
+
+test "edge case: Huffman encoding special characters" {
+    var buf: [256]u8 = undefined;
+
+    // Encode and decode string with special chars
+    const original = "text/html; charset=utf-8";
+    const enc_len = HuffmanEncoder.encode(original, &buf);
+    try testing.expect(enc_len > 0);
+
+    var decoder = HuffmanDecoder.init(testing.allocator);
+    const decoded = try decoder.decode(buf[0..enc_len]);
+    defer testing.allocator.free(decoded);
+    try testing.expectEqualStrings(original, decoded);
+}
+
+test "edge case: frame header with maximum length" {
+    // Maximum frame length is 16777215 (2^24 - 1)
+    var buf: [FRAME_HEADER_SIZE]u8 = undefined;
+    const header = FrameHeader{
+        .length = 16777215,
+        .frame_type = .data,
+        .flags = FrameFlags{},
+        .stream_id = 1,
+    };
+    header.serialize(&buf);
+
+    const parsed = FrameHeader.parse(&buf);
+    try testing.expect(parsed != null);
+    try testing.expectEqual(parsed.?.length, 16777215);
+}
+
+test "edge case: frame header with all flags set" {
+    var buf: [FRAME_HEADER_SIZE]u8 = undefined;
+    const header = FrameHeader{
+        .length = 100,
+        .frame_type = .headers,
+        .flags = FrameFlags{
+            .end_stream = true,
+            .end_headers = true,
+            .padded = true,
+            .priority = true,
+        },
+        .stream_id = 1,
+    };
+    header.serialize(&buf);
+
+    const parsed = FrameHeader.parse(&buf);
+    try testing.expect(parsed != null);
+    try testing.expect(parsed.?.flags.hasEndStream());
+    try testing.expect(parsed.?.flags.hasEndHeaders());
+    try testing.expect(parsed.?.flags.hasPadded());
+    try testing.expect(parsed.?.flags.hasPriority());
+}
+
+test "edge case: stream lifecycle via Stream struct" {
+    var stream = Stream.init(testing.allocator, 1, DEFAULT_INITIAL_WINDOW_SIZE);
+    defer stream.deinit();
+
+    // idle -> open (receive HEADERS)
+    try testing.expectEqual(stream.state, .idle);
+    try stream.onFrameReceived(.headers, FrameFlags{});
+    try testing.expectEqual(stream.state, .open);
+
+    // open -> half_closed_remote (receive END_STREAM)
+    try stream.onFrameReceived(.data, FrameFlags{ .end_stream = true });
+    try testing.expectEqual(stream.state, .half_closed_remote);
+}
+
+test "edge case: stream RST_STREAM closes from open" {
+    var stream = Stream.init(testing.allocator, 1, DEFAULT_INITIAL_WINDOW_SIZE);
+    defer stream.deinit();
+
+    // idle -> open
+    try stream.onFrameReceived(.headers, FrameFlags{});
+    try testing.expectEqual(stream.state, .open);
+
+    // RST_STREAM closes immediately
+    try stream.onFrameReceived(.rst_stream, FrameFlags{});
+    try testing.expectEqual(stream.state, .closed);
+}
+
+test "edge case: flow control window basic operations" {
+    var window = FlowControlWindow.init(65535);
+
+    // Consume some window
+    try window.consume(1000);
+    try testing.expectEqual(window.available(), 64535);
+
+    // Release window
+    try window.release(500);
+    try testing.expectEqual(window.available(), 65035);
+}
+
+test "edge case: connection GOAWAY handling" {
+    var conn = Connection.initClient(testing.allocator);
+    defer conn.deinit();
+
+    // Build and process GOAWAY
+    var goaway_buf: [64]u8 = undefined;
+    const goaway_len = Connection.buildGoaway(100, .no_error, &goaway_buf);
+
+    const header = FrameHeader.parse(goaway_buf[0..FRAME_HEADER_SIZE]).?;
+    try testing.expectEqual(header.frame_type, .goaway);
+    try testing.expect(goaway_len > 0);
+}
+
+test "edge case: connection RST_STREAM building" {
+    var buf: [FRAME_HEADER_SIZE + 4]u8 = undefined;
+
+    const error_codes = [_]ErrorCode{
+        .no_error,
+        .protocol_error,
+        .internal_error,
+        .flow_control_error,
+        .cancel,
+    };
+
+    for (error_codes) |err_code| {
+        Connection.buildRstStream(1, err_code, &buf);
+        const header = FrameHeader.parse(buf[0..FRAME_HEADER_SIZE]).?;
+        try testing.expectEqual(header.frame_type, .rst_stream);
+        try testing.expectEqual(header.length, 4);
+    }
+}
+
+test "edge case: connection PING building" {
+    var buf: [FRAME_HEADER_SIZE + 8]u8 = undefined;
+    const opaque_data = [8]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+
+    // Regular PING
+    Connection.buildPing(&opaque_data, false, &buf);
+    var header = FrameHeader.parse(buf[0..FRAME_HEADER_SIZE]).?;
+    try testing.expectEqual(header.frame_type, .ping);
+    try testing.expectEqual(header.length, 8);
+    try testing.expect(!header.flags.hasAck());
+
+    // PING ACK
+    Connection.buildPing(&opaque_data, true, &buf);
+    header = FrameHeader.parse(buf[0..FRAME_HEADER_SIZE]).?;
+    try testing.expect(header.flags.hasAck());
+}
+
+test "edge case: connection WINDOW_UPDATE building" {
+    var buf: [FRAME_HEADER_SIZE + 4]u8 = undefined;
+
+    // Connection-level (stream 0)
+    Connection.buildWindowUpdate(0, 32768, &buf);
+    var header = FrameHeader.parse(buf[0..FRAME_HEADER_SIZE]).?;
+    try testing.expectEqual(header.frame_type, .window_update);
+    try testing.expectEqual(header.stream_id, 0);
+    try testing.expectEqual(header.length, 4);
+
+    // Stream-level
+    Connection.buildWindowUpdate(1, 16384, &buf);
+    header = FrameHeader.parse(buf[0..FRAME_HEADER_SIZE]).?;
+    try testing.expectEqual(header.stream_id, 1);
+}
+
+test "edge case: SETTINGS frame building" {
+    var buf: [128]u8 = undefined;
+
+    // Build settings with defaults
+    var settings = Settings{};
+    settings.max_concurrent_streams = 100;
+    settings.initial_window_size = 65535;
+
+    const len = FrameBuilder.buildSettings(settings, false, &buf);
+    try testing.expect(len >= FRAME_HEADER_SIZE);
+
+    const header = FrameHeader.parse(buf[0..FRAME_HEADER_SIZE]).?;
+    try testing.expectEqual(header.frame_type, .settings);
+    try testing.expect(!header.flags.hasAck());
+}
+
+test "edge case: SETTINGS ACK frame building" {
+    var buf: [64]u8 = undefined;
+
+    const settings = Settings{};
+    const len = FrameBuilder.buildSettings(settings, true, &buf);
+
+    const header = FrameHeader.parse(buf[0..FRAME_HEADER_SIZE]).?;
+    try testing.expectEqual(header.frame_type, .settings);
+    try testing.expect(header.flags.hasAck());
+    try testing.expect(len >= FRAME_HEADER_SIZE);
+}
+
+test "edge case: StreamPriority serialization roundtrip" {
+    const original = StreamPriority{
+        .dependency = 5,
+        .exclusive = true,
+        .weight = 200,
+    };
+
+    var buf: [5]u8 = undefined;
+    original.serialize(&buf);
+
+    const parsed = StreamPriority.parse(&buf);
+    try testing.expect(parsed != null);
+    try testing.expectEqual(parsed.?.dependency, 5);
+    try testing.expectEqual(parsed.?.exclusive, true);
+    try testing.expectEqual(parsed.?.weight, 200);
+}
+
+test "edge case: connection client vs server stream IDs" {
+    // Client uses odd stream IDs
+    var client = Connection.initClient(testing.allocator);
+    defer client.deinit();
+    try testing.expectEqual(client.next_stream_id, 1);
+    try testing.expect(client.is_client);
+
+    // Server uses even stream IDs
+    var server = Connection.initServer(testing.allocator);
+    defer server.deinit();
+    try testing.expectEqual(server.next_stream_id, 2);
+    try testing.expect(!server.is_client);
+}
+
+test "edge case: connection createStream increments ID" {
+    var conn = Connection.initClient(testing.allocator);
+    defer conn.deinit();
+
+    const stream1 = try conn.createStream();
+    try testing.expectEqual(stream1.id, 1);
+
+    const stream2 = try conn.createStream();
+    try testing.expectEqual(stream2.id, 3); // Odd IDs for client
+
+    const stream3 = try conn.createStream();
+    try testing.expectEqual(stream3.id, 5);
 }
