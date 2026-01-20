@@ -674,3 +674,676 @@ test "Estimator concurrent safety simulation" {
 
     try testing.expectEqual(est.getBytes("concurrent_key"), 1000);
 }
+
+// ============================================================================
+// Leaky Bucket Rate Limiter
+// ============================================================================
+
+/// A leaky bucket rate limiter.
+/// 
+/// The bucket fills with tokens at a constant rate and empties as requests arrive.
+/// This provides smooth rate limiting without bursting.
+pub const LeakyBucket = struct {
+    /// Maximum capacity of the bucket
+    capacity: f64,
+    /// Rate at which the bucket leaks (tokens per second)
+    leak_rate: f64,
+    /// Current water level (tokens in bucket)
+    level: std.atomic.Value(u64),
+    /// Last update timestamp (nanoseconds)
+    last_update_ns: std.atomic.Value(i64),
+    /// Lock for updates
+    updating: std.atomic.Value(bool),
+
+    const Self = @This();
+
+    /// Create a new leaky bucket.
+    /// - capacity: Maximum burst size (tokens)
+    /// - rate_per_second: Steady-state rate limit
+    pub fn init(capacity: f64, rate_per_second: f64) Self {
+        return .{
+            .capacity = capacity,
+            .leak_rate = rate_per_second,
+            .level = std.atomic.Value(u64).init(0),
+            .last_update_ns = std.atomic.Value(i64).init(@intCast(std.time.nanoTimestamp())),
+            .updating = std.atomic.Value(bool).init(false),
+        };
+    }
+
+    /// Try to acquire tokens from the bucket.
+    /// Returns true if allowed, false if rate limited.
+    pub fn acquire(self: *Self, tokens: f64) bool {
+        return self.acquireAt(tokens, @intCast(std.time.nanoTimestamp()));
+    }
+
+    /// Try to acquire tokens at a specific timestamp (for testing).
+    pub fn acquireAt(self: *Self, tokens: f64, now_ns: i64) bool {
+        // Try to acquire lock
+        if (self.updating.cmpxchgStrong(false, true, .seq_cst, .seq_cst)) |_| {
+            // Another thread is updating, try again later
+            return false;
+        }
+        defer self.updating.store(false, .seq_cst);
+
+        // Calculate leaked amount since last update
+        const last_ns = self.last_update_ns.load(.seq_cst);
+        const elapsed_ns = now_ns - last_ns;
+        const elapsed_secs = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
+
+        // Current level (using u64 bits to store f64)
+        const current_bits = self.level.load(.seq_cst);
+        var current_level: f64 = @bitCast(current_bits);
+
+        // Leak water from bucket
+        const leaked = elapsed_secs * self.leak_rate;
+        current_level = @max(0, current_level - leaked);
+
+        // Try to add tokens
+        const new_level = current_level + tokens;
+        if (new_level > self.capacity) {
+            // Bucket would overflow - rate limited
+            return false;
+        }
+
+        // Update level and timestamp
+        self.level.store(@bitCast(new_level), .seq_cst);
+        self.last_update_ns.store(now_ns, .seq_cst);
+
+        return true;
+    }
+
+    /// Get current fill level (0.0 to 1.0)
+    pub fn fillLevel(self: *Self) f64 {
+        const now_ns = std.time.nanoTimestamp();
+        const last_ns = self.last_update_ns.load(.seq_cst);
+        const elapsed_ns = now_ns - last_ns;
+        const elapsed_secs = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
+
+        const current_bits = self.level.load(.seq_cst);
+        var current_level: f64 = @bitCast(current_bits);
+
+        const leaked = elapsed_secs * self.leak_rate;
+        current_level = @max(0, current_level - leaked);
+
+        return current_level / self.capacity;
+    }
+
+    /// Reset the bucket to empty
+    pub fn reset(self: *Self) void {
+        self.level.store(@bitCast(@as(f64, 0)), .seq_cst);
+        self.last_update_ns.store(@intCast(std.time.nanoTimestamp()), .seq_cst);
+    }
+};
+
+// ============================================================================
+// Token Bucket Rate Limiter
+// ============================================================================
+
+/// A token bucket rate limiter.
+///
+/// Tokens are added at a constant rate up to a maximum capacity.
+/// Requests consume tokens; if not enough tokens, request is denied.
+/// Unlike leaky bucket, this allows controlled bursting.
+pub const TokenBucket = struct {
+    /// Maximum tokens the bucket can hold
+    capacity: f64,
+    /// Rate at which tokens are added (tokens per second)
+    refill_rate: f64,
+    /// Current number of tokens
+    tokens: std.atomic.Value(u64),
+    /// Last refill timestamp (nanoseconds)
+    last_refill_ns: std.atomic.Value(i64),
+    /// Lock for updates
+    updating: std.atomic.Value(bool),
+
+    const Self = @This();
+
+    /// Create a new token bucket.
+    /// - capacity: Maximum burst size
+    /// - refill_rate: Tokens added per second
+    pub fn init(capacity: f64, refill_rate: f64) Self {
+        return .{
+            .capacity = capacity,
+            .refill_rate = refill_rate,
+            .tokens = std.atomic.Value(u64).init(@bitCast(capacity)), // Start full
+            .last_refill_ns = std.atomic.Value(i64).init(@intCast(std.time.nanoTimestamp())),
+            .updating = std.atomic.Value(bool).init(false),
+        };
+    }
+
+    /// Create a token bucket that starts empty.
+    pub fn initEmpty(capacity: f64, refill_rate: f64) Self {
+        return .{
+            .capacity = capacity,
+            .refill_rate = refill_rate,
+            .tokens = std.atomic.Value(u64).init(@bitCast(@as(f64, 0))),
+            .last_refill_ns = std.atomic.Value(i64).init(@intCast(std.time.nanoTimestamp())),
+            .updating = std.atomic.Value(bool).init(false),
+        };
+    }
+
+    /// Try to consume tokens from the bucket.
+    /// Returns true if tokens were consumed, false if not enough tokens.
+    pub fn consume(self: *Self, tokens: f64) bool {
+        return self.consumeAt(tokens, @intCast(std.time.nanoTimestamp()));
+    }
+
+    /// Try to consume tokens at a specific timestamp (for testing).
+    pub fn consumeAt(self: *Self, tokens_needed: f64, now_ns: i64) bool {
+        // Try to acquire lock
+        if (self.updating.cmpxchgStrong(false, true, .seq_cst, .seq_cst)) |_| {
+            return false;
+        }
+        defer self.updating.store(false, .seq_cst);
+
+        // Refill tokens based on elapsed time
+        const last_ns = self.last_refill_ns.load(.seq_cst);
+        const elapsed_ns = now_ns - last_ns;
+        const elapsed_secs = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
+
+        const current_bits = self.tokens.load(.seq_cst);
+        var current_tokens: f64 = @bitCast(current_bits);
+
+        // Add tokens based on elapsed time
+        const refilled = elapsed_secs * self.refill_rate;
+        current_tokens = @min(self.capacity, current_tokens + refilled);
+
+        // Check if we have enough tokens
+        if (current_tokens < tokens_needed) {
+            return false;
+        }
+
+        // Consume tokens
+        current_tokens -= tokens_needed;
+        self.tokens.store(@bitCast(current_tokens), .seq_cst);
+        self.last_refill_ns.store(now_ns, .seq_cst);
+
+        return true;
+    }
+
+    /// Get current token count
+    pub fn availableTokens(self: *Self) f64 {
+        const now_ns = std.time.nanoTimestamp();
+        const last_ns = self.last_refill_ns.load(.seq_cst);
+        const elapsed_ns = now_ns - last_ns;
+        const elapsed_secs = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
+
+        const current_bits = self.tokens.load(.seq_cst);
+        var current_tokens: f64 = @bitCast(current_bits);
+
+        const refilled = elapsed_secs * self.refill_rate;
+        current_tokens = @min(self.capacity, current_tokens + refilled);
+
+        return current_tokens;
+    }
+
+    /// Time until n tokens are available (in seconds)
+    pub fn timeUntilAvailable(self: *Self, tokens_needed: f64) f64 {
+        const available = self.availableTokens();
+        if (available >= tokens_needed) return 0;
+
+        const deficit = tokens_needed - available;
+        return deficit / self.refill_rate;
+    }
+
+    /// Reset bucket to full capacity
+    pub fn reset(self: *Self) void {
+        self.tokens.store(@bitCast(self.capacity), .seq_cst);
+        self.last_refill_ns.store(@intCast(std.time.nanoTimestamp()), .seq_cst);
+    }
+};
+
+// ============================================================================
+// Sliding Window Rate Limiter
+// ============================================================================
+
+/// A sliding window rate limiter using multiple time slots.
+///
+/// More accurate than fixed windows, less bursty at window boundaries.
+pub const SlidingWindowLimiter = struct {
+    /// Counters for each slot
+    slots: []std.atomic.Value(u64),
+    /// Number of slots
+    num_slots: usize,
+    /// Duration of the entire window (nanoseconds)
+    window_ns: u64,
+    /// Duration of each slot (nanoseconds)
+    slot_ns: u64,
+    /// Maximum requests per window
+    max_requests: u64,
+    /// Current slot index
+    current_slot: std.atomic.Value(usize),
+    /// Timestamp of current slot start
+    slot_start_ns: std.atomic.Value(i64),
+    /// Allocator
+    allocator: Allocator,
+
+    const Self = @This();
+
+    /// Create a new sliding window limiter.
+    /// - window_seconds: Total window duration
+    /// - num_slots: Number of slots (more = more accurate, more memory)
+    /// - max_requests: Maximum requests allowed per window
+    pub fn init(allocator: Allocator, window_seconds: u64, num_slots: usize, max_requests: u64) !Self {
+        const slots = try allocator.alloc(std.atomic.Value(u64), num_slots);
+        for (slots) |*slot| {
+            slot.* = std.atomic.Value(u64).init(0);
+        }
+
+        const window_ns = window_seconds * std.time.ns_per_s;
+        const slot_ns = window_ns / num_slots;
+
+        return .{
+            .slots = slots,
+            .num_slots = num_slots,
+            .window_ns = window_ns,
+            .slot_ns = slot_ns,
+            .max_requests = max_requests,
+            .current_slot = std.atomic.Value(usize).init(0),
+            .slot_start_ns = std.atomic.Value(i64).init(@intCast(std.time.nanoTimestamp())),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.allocator.free(self.slots);
+    }
+
+    /// Try to record a request. Returns true if allowed, false if rate limited.
+    pub fn allow(self: *Self) bool {
+        return self.allowN(1);
+    }
+
+    /// Try to record N requests.
+    pub fn allowN(self: *Self, n: u64) bool {
+        self.advanceSlots();
+
+        // Count total requests in window
+        var total: u64 = 0;
+        for (self.slots) |*slot| {
+            total += slot.load(.seq_cst);
+        }
+
+        if (total + n > self.max_requests) {
+            return false;
+        }
+
+        // Record the request
+        const slot_idx = self.current_slot.load(.seq_cst);
+        _ = self.slots[slot_idx].fetchAdd(n, .seq_cst);
+
+        return true;
+    }
+
+    /// Get current request count in window
+    pub fn currentCount(self: *Self) u64 {
+        self.advanceSlots();
+
+        var total: u64 = 0;
+        for (self.slots) |*slot| {
+            total += slot.load(.seq_cst);
+        }
+        return total;
+    }
+
+    /// Get remaining requests allowed
+    pub fn remaining(self: *Self) u64 {
+        const current = self.currentCount();
+        if (current >= self.max_requests) return 0;
+        return self.max_requests - current;
+    }
+
+    /// Advance slots if needed based on elapsed time
+    fn advanceSlots(self: *Self) void {
+        const now_ns = std.time.nanoTimestamp();
+        const start_ns = self.slot_start_ns.load(.seq_cst);
+        const elapsed_ns: u64 = @intCast(@max(0, now_ns - start_ns));
+
+        // How many slots have passed?
+        const slots_passed = elapsed_ns / self.slot_ns;
+        if (slots_passed == 0) return;
+
+        const current_idx = self.current_slot.load(.seq_cst);
+
+        // Clear passed slots
+        const to_clear = @min(slots_passed, self.num_slots);
+        for (0..to_clear) |i| {
+            const idx = (current_idx + 1 + i) % self.num_slots;
+            self.slots[idx].store(0, .seq_cst);
+        }
+
+        // Update current slot
+        const new_idx = (current_idx + slots_passed) % self.num_slots;
+        self.current_slot.store(new_idx, .seq_cst);
+
+        // Update slot start time
+        const new_start = start_ns + @as(i64, @intCast(slots_passed * self.slot_ns));
+        self.slot_start_ns.store(new_start, .seq_cst);
+    }
+
+    /// Reset all counters
+    pub fn reset(self: *Self) void {
+        for (self.slots) |*slot| {
+            slot.store(0, .seq_cst);
+        }
+        self.current_slot.store(0, .seq_cst);
+        self.slot_start_ns.store(@intCast(std.time.nanoTimestamp()), .seq_cst);
+    }
+};
+
+// ============================================================================
+// Distributed Rate Limiter (for multi-key scenarios)
+// ============================================================================
+
+/// A rate limiter that tracks rates per key using a hash map.
+pub const KeyedRateLimiter = struct {
+    /// Token buckets per key
+    buckets: std.StringHashMapUnmanaged(TokenBucket),
+    /// Default capacity for new buckets
+    default_capacity: f64,
+    /// Default refill rate for new buckets
+    default_refill_rate: f64,
+    /// Maximum number of keys to track
+    max_keys: usize,
+    /// Allocator
+    allocator: Allocator,
+
+    const Self = @This();
+
+    /// Create a new keyed rate limiter.
+    pub fn init(allocator: Allocator, default_capacity: f64, default_refill_rate: f64, max_keys: usize) Self {
+        return .{
+            .buckets = .{},
+            .default_capacity = default_capacity,
+            .default_refill_rate = default_refill_rate,
+            .max_keys = max_keys,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.buckets.deinit(self.allocator);
+    }
+
+    /// Check if a request for the given key is allowed.
+    pub fn allow(self: *Self, key: []const u8) !bool {
+        return self.allowN(key, 1);
+    }
+
+    /// Check if N requests for the given key are allowed.
+    pub fn allowN(self: *Self, key: []const u8, n: f64) !bool {
+        // Get or create bucket for key
+        if (self.buckets.getPtr(key)) |bucket| {
+            return bucket.consume(n);
+        }
+
+        // Create new bucket if under limit
+        if (self.buckets.count() >= self.max_keys) {
+            return false; // Too many keys
+        }
+
+        var bucket = TokenBucket.init(self.default_capacity, self.default_refill_rate);
+        const allowed = bucket.consume(n);
+        try self.buckets.put(self.allocator, key, bucket);
+        return allowed;
+    }
+
+    /// Get remaining tokens for a key
+    pub fn remaining(self: *Self, key: []const u8) f64 {
+        if (self.buckets.getPtr(key)) |bucket| {
+            return bucket.availableTokens();
+        }
+        return self.default_capacity;
+    }
+
+    /// Remove a key from tracking
+    pub fn remove(self: *Self, key: []const u8) void {
+        _ = self.buckets.remove(key);
+    }
+
+    /// Clear all tracked keys
+    pub fn clear(self: *Self) void {
+        self.buckets.clearRetainingCapacity();
+    }
+};
+
+// ============================================================================
+// Additional Rate Calculation Functions
+// ============================================================================
+
+/// Exponentially weighted moving average rate calculation.
+/// Gives more weight to recent observations.
+pub fn ewmaRateCalc(components: RateComponents) f64 {
+    const alpha = 0.3; // Smoothing factor
+    const curr: f64 = @floatFromInt(components.curr_interval_count);
+    const prev: f64 = @floatFromInt(components.prev_interval_count);
+
+    // Extrapolate current interval if not complete
+    const extrapolated_curr = if (components.elapsed_fraction > 0)
+        curr / components.elapsed_fraction
+    else
+        0;
+
+    return alpha * extrapolated_curr + (1.0 - alpha) * prev;
+}
+
+/// Peak rate calculation - returns the maximum of current and previous.
+pub fn peakRateCalc(components: RateComponents) f64 {
+    const curr: f64 = @floatFromInt(components.curr_interval_count);
+    const prev: f64 = @floatFromInt(components.prev_interval_count);
+
+    // Extrapolate current
+    const extrapolated = if (components.elapsed_fraction > 0.1)
+        curr / components.elapsed_fraction
+    else
+        curr;
+
+    return @max(extrapolated, prev);
+}
+
+/// Minimum rate calculation - conservative estimate.
+pub fn minRateCalc(components: RateComponents) f64 {
+    const curr: f64 = @floatFromInt(components.curr_interval_count);
+    const prev: f64 = @floatFromInt(components.prev_interval_count);
+
+    return @min(curr, prev);
+}
+
+// ============================================================================
+// Rate Limiter Result
+// ============================================================================
+
+/// Result from a rate limit check
+pub const RateLimitResult = struct {
+    /// Whether the request is allowed
+    allowed: bool,
+    /// Current request count/tokens
+    current: f64,
+    /// Maximum allowed
+    limit: f64,
+    /// Time until reset (seconds), 0 if allowed
+    retry_after_secs: f64,
+    /// Remaining capacity
+    remaining: f64,
+
+    pub fn allow() RateLimitResult {
+        return .{
+            .allowed = true,
+            .current = 0,
+            .limit = 0,
+            .retry_after_secs = 0,
+            .remaining = 0,
+        };
+    }
+
+    pub fn deny(current: f64, limit: f64, retry_after: f64) RateLimitResult {
+        return .{
+            .allowed = false,
+            .current = current,
+            .limit = limit,
+            .retry_after_secs = retry_after,
+            .remaining = 0,
+        };
+    }
+};
+
+// ============================================================================
+// Additional Tests
+// ============================================================================
+
+test "LeakyBucket basic" {
+    var bucket = LeakyBucket.init(10.0, 1.0); // 10 capacity, 1 per second leak
+
+    // Should allow requests up to capacity
+    try testing.expect(bucket.acquire(5.0));
+    try testing.expect(bucket.acquire(5.0));
+
+    // Should deny when full
+    try testing.expect(!bucket.acquire(1.0));
+}
+
+test "LeakyBucket reset" {
+    var bucket = LeakyBucket.init(10.0, 1.0);
+
+    _ = bucket.acquire(10.0);
+    try testing.expect(!bucket.acquire(1.0));
+
+    bucket.reset();
+    try testing.expect(bucket.acquire(5.0));
+}
+
+test "TokenBucket basic" {
+    var bucket = TokenBucket.init(10.0, 1.0); // 10 capacity, 1 per second refill
+
+    // Should have full capacity initially
+    try testing.expect(bucket.consume(5.0));
+    try testing.expect(bucket.consume(5.0));
+
+    // Should be empty now
+    try testing.expect(!bucket.consume(1.0));
+}
+
+test "TokenBucket initEmpty" {
+    var bucket = TokenBucket.initEmpty(10.0, 100.0); // Empty, fast refill
+
+    // Should be empty initially
+    const available = bucket.availableTokens();
+    try testing.expect(available < 10.0); // Some time may have passed
+}
+
+test "TokenBucket timeUntilAvailable" {
+    var bucket = TokenBucket.initEmpty(10.0, 10.0); // 10 tokens/sec
+
+    // Need 5 tokens, should take about 0.5 seconds
+    const time_needed = bucket.timeUntilAvailable(5.0);
+    try testing.expect(time_needed <= 0.6); // Allow some margin
+}
+
+test "SlidingWindowLimiter basic" {
+    var limiter = try SlidingWindowLimiter.init(testing.allocator, 1, 10, 100);
+    defer limiter.deinit();
+
+    // Should allow up to max_requests
+    for (0..100) |_| {
+        try testing.expect(limiter.allow());
+    }
+
+    // Should deny after limit
+    try testing.expect(!limiter.allow());
+}
+
+test "SlidingWindowLimiter remaining" {
+    var limiter = try SlidingWindowLimiter.init(testing.allocator, 1, 10, 100);
+    defer limiter.deinit();
+
+    try testing.expectEqual(@as(u64, 100), limiter.remaining());
+
+    _ = limiter.allow();
+    try testing.expectEqual(@as(u64, 99), limiter.remaining());
+}
+
+test "SlidingWindowLimiter reset" {
+    var limiter = try SlidingWindowLimiter.init(testing.allocator, 1, 10, 100);
+    defer limiter.deinit();
+
+    for (0..50) |_| {
+        _ = limiter.allow();
+    }
+
+    limiter.reset();
+    try testing.expectEqual(@as(u64, 100), limiter.remaining());
+}
+
+test "KeyedRateLimiter basic" {
+    var limiter = KeyedRateLimiter.init(testing.allocator, 10.0, 1.0, 100);
+    defer limiter.deinit();
+
+    // First request should be allowed
+    try testing.expect(try limiter.allow("user1"));
+    try testing.expect(try limiter.allow("user2"));
+}
+
+test "KeyedRateLimiter per-key limits" {
+    var limiter = KeyedRateLimiter.init(testing.allocator, 5.0, 1.0, 100);
+    defer limiter.deinit();
+
+    // Exhaust user1's limit
+    for (0..5) |_| {
+        _ = try limiter.allow("user1");
+    }
+
+    // user1 should be denied
+    try testing.expect(!try limiter.allow("user1"));
+
+    // user2 should still be allowed
+    try testing.expect(try limiter.allow("user2"));
+}
+
+test "ewmaRateCalc" {
+    const components = RateComponents{
+        .curr_interval_count = 100,
+        .prev_interval_count = 80,
+        .interval_ms = 1000,
+        .elapsed_fraction = 0.5,
+    };
+
+    const result = ewmaRateCalc(components);
+    // alpha=0.3: 0.3 * (100/0.5) + 0.7 * 80 = 0.3 * 200 + 56 = 60 + 56 = 116
+    try testing.expect(result > 100 and result < 150);
+}
+
+test "peakRateCalc" {
+    const components = RateComponents{
+        .curr_interval_count = 50,
+        .prev_interval_count = 100,
+        .interval_ms = 1000,
+        .elapsed_fraction = 0.5,
+    };
+
+    const result = peakRateCalc(components);
+    // max(50/0.5, 100) = max(100, 100) = 100
+    try testing.expectEqual(@as(f64, 100), result);
+}
+
+test "minRateCalc" {
+    const components = RateComponents{
+        .curr_interval_count = 50,
+        .prev_interval_count = 100,
+        .interval_ms = 1000,
+        .elapsed_fraction = 0.5,
+    };
+
+    const result = minRateCalc(components);
+    try testing.expectEqual(@as(f64, 50), result);
+}
+
+test "RateLimitResult" {
+    const allowed = RateLimitResult.allow();
+    try testing.expect(allowed.allowed);
+
+    const denied = RateLimitResult.deny(100, 50, 10);
+    try testing.expect(!denied.allowed);
+    try testing.expectEqual(@as(f64, 100), denied.current);
+    try testing.expectEqual(@as(f64, 50), denied.limit);
+    try testing.expectEqual(@as(f64, 10), denied.retry_after_secs);
+}

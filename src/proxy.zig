@@ -252,6 +252,72 @@ pub const FilterResult = enum {
     retry,
 };
 
+/// Result returned by fail_to_proxy callback
+pub const FailToProxy = struct {
+    /// HTTP error code sent to downstream (0 means no response sent)
+    error_code: u16,
+    /// Whether the downstream connection can be reused
+    can_reuse_downstream: bool,
+};
+
+/// Response cacheability result
+pub const RespCacheable = union(enum) {
+    /// Response is cacheable with the given TTL in seconds
+    cacheable: CacheableMeta,
+    /// Response is not cacheable
+    uncacheable: NoCacheReason,
+};
+
+/// Metadata for cacheable responses
+pub const CacheableMeta = struct {
+    /// Time-to-live in seconds
+    ttl_seconds: u64 = 3600,
+    /// Whether the response can be stored in shared caches
+    shared: bool = true,
+    /// Whether to store despite Set-Cookie header
+    store_with_set_cookie: bool = false,
+};
+
+/// Reasons why a response is not cacheable
+pub const NoCacheReason = enum {
+    /// Response status code is not cacheable
+    response_status,
+    /// Cache-Control: no-store
+    no_store,
+    /// Cache-Control: private
+    private,
+    /// Response has Set-Cookie header
+    set_cookie,
+    /// Response varies on uncacheable headers
+    vary,
+    /// User-defined reason
+    custom,
+    /// Method is not cacheable (only GET/HEAD)
+    method_not_cacheable,
+    /// Response is too large
+    response_too_large,
+    /// No explicit caching headers
+    no_cache_headers,
+    /// Origin server error
+    origin_error,
+    /// Internal error during caching
+    internal_error,
+    /// Default - caching disabled
+    default,
+};
+
+/// Purge operation status
+pub const PurgeStatus = enum {
+    /// Purge succeeded
+    success,
+    /// Item was not found in cache
+    not_found,
+    /// Purge failed
+    failed,
+    /// Partial purge (some items purged)
+    partial,
+};
+
 /// The interface to control the HTTP proxy
 ///
 /// This uses Zig's interface pattern with function pointers.
@@ -273,15 +339,27 @@ pub const ProxyHttp = struct {
         /// This is the only required callback.
         upstreamPeer: *const fn (ptr: *anyopaque, session: *Session, ctx: ?*anyopaque) ProxyError!?*upstream.Peer,
 
+        /// Handle the incoming request before any downstream module
+        /// This runs before request_filter and allows finer control over module behavior
+        earlyRequestFilter: *const fn (ptr: *anyopaque, session: *Session, ctx: ?*anyopaque) ProxyError!void,
+
         /// Handle the incoming request (before upstream)
         /// Return true if response was sent and request should end
         requestFilter: *const fn (ptr: *anyopaque, session: *Session, ctx: ?*anyopaque) ProxyError!FilterResult,
+
+        /// Filter request body chunks as they arrive
+        /// body is the current chunk (not the entire body)
+        requestBodyFilter: *const fn (ptr: *anyopaque, session: *Session, body: ?[]const u8, end_of_stream: bool, ctx: ?*anyopaque) ProxyError!void,
 
         /// Modify the request before sending to upstream
         upstreamRequestFilter: *const fn (ptr: *anyopaque, session: *Session, upstream_request: *http.RequestHeader, ctx: ?*anyopaque) ProxyError!void,
 
         /// Modify the response from upstream before sending downstream
         upstreamResponseFilter: *const fn (ptr: *anyopaque, session: *Session, upstream_response: *http.ResponseHeader, ctx: ?*anyopaque) ProxyError!void,
+
+        /// Filter response body chunks from upstream
+        /// body is the current chunk (not the entire body)
+        responseBodyFilter: *const fn (ptr: *anyopaque, session: *Session, body: ?[]u8, end_of_stream: bool, ctx: ?*anyopaque) ProxyError!void,
 
         /// Final modification of response before sending to client
         responseFilter: *const fn (ptr: *anyopaque, session: *Session, response: *http.ResponseHeader, ctx: ?*anyopaque) ProxyError!void,
@@ -295,8 +373,40 @@ pub const ProxyHttp = struct {
         /// Check if request should use cache
         requestCacheFilter: *const fn (ptr: *anyopaque, session: *Session, ctx: ?*anyopaque) bool,
 
+        /// Generate custom cache key for this request
+        /// Called only when cache is enabled
+        cacheKeyCallback: *const fn (ptr: *anyopaque, session: *Session, ctx: ?*anyopaque) ?cache.CacheKey,
+
+        /// Called on cache miss, before fetching from upstream
+        cacheMissFilter: *const fn (ptr: *anyopaque, session: *Session, ctx: ?*anyopaque) void,
+
+        /// Called on cache hit, allows force invalidation
+        /// Returns true to force revalidation
+        cacheHitFilter: *const fn (ptr: *anyopaque, session: *Session, is_fresh: bool, ctx: ?*anyopaque) bool,
+
+        /// Decide if response is cacheable
+        responseCacheFilter: *const fn (ptr: *anyopaque, session: *Session, response: *const http.ResponseHeader, ctx: ?*anyopaque) RespCacheable,
+
+        /// Decide if request should continue to upstream after cache miss
+        /// Returns true if request should continue, false if response was written
+        proxyUpstreamFilter: *const fn (ptr: *anyopaque, session: *Session, ctx: ?*anyopaque) ProxyError!bool,
+
         /// Determine if upstream should be retried on error
         shouldRetry: *const fn (ptr: *anyopaque, session: *Session, err_val: ProxyError, ctx: ?*anyopaque) bool,
+
+        /// Called when connection to upstream fails
+        /// Allows marking error as retryable or selecting different peer
+        failToConnect: *const fn (ptr: *anyopaque, session: *Session, peer: *upstream.Peer, err_val: ProxyError, ctx: ?*anyopaque) ProxyError,
+
+        /// Called when proxy encounters a fatal error
+        /// Write error response to downstream and return status
+        failToProxy: *const fn (ptr: *anyopaque, session: *Session, err_val: ProxyError, ctx: ?*anyopaque) FailToProxy,
+
+        /// Check if request is a cache purge request
+        isPurge: *const fn (ptr: *anyopaque, session: *Session, ctx: ?*anyopaque) bool,
+
+        /// Modify the purge response before sending to downstream
+        purgeResponseFilter: *const fn (ptr: *anyopaque, session: *Session, status: PurgeStatus, response: *http.ResponseHeader, ctx: ?*anyopaque) ProxyError!void,
     };
 
     /// Create a new per-request context
@@ -314,9 +424,19 @@ pub const ProxyHttp = struct {
         return self.vtable.upstreamPeer(self.ptr, session, ctx);
     }
 
+    /// Early request filter (before any modules)
+    pub fn earlyRequestFilter(self: ProxyHttp, session: *Session, ctx: ?*anyopaque) ProxyError!void {
+        return self.vtable.earlyRequestFilter(self.ptr, session, ctx);
+    }
+
     /// Request filter
     pub fn requestFilter(self: ProxyHttp, session: *Session, ctx: ?*anyopaque) ProxyError!FilterResult {
         return self.vtable.requestFilter(self.ptr, session, ctx);
+    }
+
+    /// Request body filter
+    pub fn requestBodyFilter(self: ProxyHttp, session: *Session, body: ?[]const u8, end_of_stream: bool, ctx: ?*anyopaque) ProxyError!void {
+        return self.vtable.requestBodyFilter(self.ptr, session, body, end_of_stream, ctx);
     }
 
     /// Upstream request filter
@@ -327,6 +447,11 @@ pub const ProxyHttp = struct {
     /// Upstream response filter
     pub fn upstreamResponseFilter(self: ProxyHttp, session: *Session, upstream_response: *http.ResponseHeader, ctx: ?*anyopaque) ProxyError!void {
         return self.vtable.upstreamResponseFilter(self.ptr, session, upstream_response, ctx);
+    }
+
+    /// Response body filter
+    pub fn responseBodyFilter(self: ProxyHttp, session: *Session, body: ?[]u8, end_of_stream: bool, ctx: ?*anyopaque) ProxyError!void {
+        return self.vtable.responseBodyFilter(self.ptr, session, body, end_of_stream, ctx);
     }
 
     /// Response filter
@@ -349,9 +474,54 @@ pub const ProxyHttp = struct {
         return self.vtable.requestCacheFilter(self.ptr, session, ctx);
     }
 
+    /// Cache key callback - generate custom cache key
+    pub fn cacheKeyCallback(self: ProxyHttp, session: *Session, ctx: ?*anyopaque) ?cache.CacheKey {
+        return self.vtable.cacheKeyCallback(self.ptr, session, ctx);
+    }
+
+    /// Cache miss filter
+    pub fn cacheMissFilter(self: ProxyHttp, session: *Session, ctx: ?*anyopaque) void {
+        self.vtable.cacheMissFilter(self.ptr, session, ctx);
+    }
+
+    /// Cache hit filter - returns true to force revalidation
+    pub fn cacheHitFilter(self: ProxyHttp, session: *Session, is_fresh: bool, ctx: ?*anyopaque) bool {
+        return self.vtable.cacheHitFilter(self.ptr, session, is_fresh, ctx);
+    }
+
+    /// Response cache filter - decide if response is cacheable
+    pub fn responseCacheFilter(self: ProxyHttp, session: *Session, response: *const http.ResponseHeader, ctx: ?*anyopaque) RespCacheable {
+        return self.vtable.responseCacheFilter(self.ptr, session, response, ctx);
+    }
+
+    /// Proxy upstream filter - decide if request should go to upstream
+    pub fn proxyUpstreamFilter(self: ProxyHttp, session: *Session, ctx: ?*anyopaque) ProxyError!bool {
+        return self.vtable.proxyUpstreamFilter(self.ptr, session, ctx);
+    }
+
     /// Should retry
     pub fn shouldRetry(self: ProxyHttp, session: *Session, err_val: ProxyError, ctx: ?*anyopaque) bool {
         return self.vtable.shouldRetry(self.ptr, session, err_val, ctx);
+    }
+
+    /// Fail to connect - called when upstream connection fails
+    pub fn failToConnect(self: ProxyHttp, session: *Session, peer: *upstream.Peer, err_val: ProxyError, ctx: ?*anyopaque) ProxyError {
+        return self.vtable.failToConnect(self.ptr, session, peer, err_val, ctx);
+    }
+
+    /// Fail to proxy - called on fatal errors
+    pub fn failToProxy(self: ProxyHttp, session: *Session, err_val: ProxyError, ctx: ?*anyopaque) FailToProxy {
+        return self.vtable.failToProxy(self.ptr, session, err_val, ctx);
+    }
+
+    /// Check if request is a purge request
+    pub fn isPurge(self: ProxyHttp, session: *Session, ctx: ?*anyopaque) bool {
+        return self.vtable.isPurge(self.ptr, session, ctx);
+    }
+
+    /// Purge response filter
+    pub fn purgeResponseFilter(self: ProxyHttp, session: *Session, status: PurgeStatus, response: *http.ResponseHeader, ctx: ?*anyopaque) ProxyError!void {
+        return self.vtable.purgeResponseFilter(self.ptr, session, status, response, ctx);
     }
 };
 
@@ -383,12 +553,26 @@ pub fn proxyHttpFrom(comptime T: type, impl: *T) ProxyHttp {
             return self.upstreamPeer(session, ctx);
         }
 
+        fn earlyRequestFilter(ptr: *anyopaque, session: *Session, ctx: ?*anyopaque) ProxyError!void {
+            const self: *T = @ptrCast(@alignCast(ptr));
+            if (@hasDecl(T, "earlyRequestFilter")) {
+                return self.earlyRequestFilter(session, ctx);
+            }
+        }
+
         fn requestFilter(ptr: *anyopaque, session: *Session, ctx: ?*anyopaque) ProxyError!FilterResult {
             const self: *T = @ptrCast(@alignCast(ptr));
             if (@hasDecl(T, "requestFilter")) {
                 return self.requestFilter(session, ctx);
             }
             return .@"continue";
+        }
+
+        fn requestBodyFilter(ptr: *anyopaque, session: *Session, body: ?[]const u8, end_of_stream: bool, ctx: ?*anyopaque) ProxyError!void {
+            const self: *T = @ptrCast(@alignCast(ptr));
+            if (@hasDecl(T, "requestBodyFilter")) {
+                return self.requestBodyFilter(session, body, end_of_stream, ctx);
+            }
         }
 
         fn upstreamRequestFilter(ptr: *anyopaque, session: *Session, upstream_request: *http.RequestHeader, ctx: ?*anyopaque) ProxyError!void {
@@ -402,6 +586,13 @@ pub fn proxyHttpFrom(comptime T: type, impl: *T) ProxyHttp {
             const self: *T = @ptrCast(@alignCast(ptr));
             if (@hasDecl(T, "upstreamResponseFilter")) {
                 return self.upstreamResponseFilter(session, upstream_response, ctx);
+            }
+        }
+
+        fn responseBodyFilter(ptr: *anyopaque, session: *Session, body: ?[]u8, end_of_stream: bool, ctx: ?*anyopaque) ProxyError!void {
+            const self: *T = @ptrCast(@alignCast(ptr));
+            if (@hasDecl(T, "responseBodyFilter")) {
+                return self.responseBodyFilter(session, body, end_of_stream, ctx);
             }
         }
 
@@ -434,6 +625,53 @@ pub fn proxyHttpFrom(comptime T: type, impl: *T) ProxyHttp {
             return false; // caching disabled by default
         }
 
+        fn cacheKeyCallback(ptr: *anyopaque, session: *Session, ctx: ?*anyopaque) ?cache.CacheKey {
+            const self: *T = @ptrCast(@alignCast(ptr));
+            if (@hasDecl(T, "cacheKeyCallback")) {
+                return self.cacheKeyCallback(session, ctx);
+            }
+            // Default: generate key from request
+            if (session.reqHeader()) |req| {
+                return cache.CacheKey.fromRequest(session.allocator, req) catch null;
+            }
+            return null;
+        }
+
+        fn cacheMissFilter(ptr: *anyopaque, session: *Session, ctx: ?*anyopaque) void {
+            const self: *T = @ptrCast(@alignCast(ptr));
+            if (@hasDecl(T, "cacheMissFilter")) {
+                self.cacheMissFilter(session, ctx);
+            }
+            // Default: do nothing
+        }
+
+        fn cacheHitFilter(ptr: *anyopaque, session: *Session, is_fresh: bool, ctx: ?*anyopaque) bool {
+            const self: *T = @ptrCast(@alignCast(ptr));
+            if (@hasDecl(T, "cacheHitFilter")) {
+                return self.cacheHitFilter(session, is_fresh, ctx);
+            }
+            // Default: don't force revalidation
+            return false;
+        }
+
+        fn responseCacheFilter(ptr: *anyopaque, session: *Session, response: *const http.ResponseHeader, ctx: ?*anyopaque) RespCacheable {
+            const self: *T = @ptrCast(@alignCast(ptr));
+            if (@hasDecl(T, "responseCacheFilter")) {
+                return self.responseCacheFilter(session, response, ctx);
+            }
+            // Default: not cacheable
+            return .{ .uncacheable = .default };
+        }
+
+        fn proxyUpstreamFilter(ptr: *anyopaque, session: *Session, ctx: ?*anyopaque) ProxyError!bool {
+            const self: *T = @ptrCast(@alignCast(ptr));
+            if (@hasDecl(T, "proxyUpstreamFilter")) {
+                return self.proxyUpstreamFilter(session, ctx);
+            }
+            // Default: continue to upstream
+            return true;
+        }
+
         fn shouldRetry(ptr: *anyopaque, session: *Session, err_val: ProxyError, ctx: ?*anyopaque) bool {
             const self: *T = @ptrCast(@alignCast(ptr));
             if (@hasDecl(T, "shouldRetry")) {
@@ -443,18 +681,94 @@ pub fn proxyHttpFrom(comptime T: type, impl: *T) ProxyHttp {
             return err_val == ProxyError.UpstreamConnectionFailed;
         }
 
+        const failToConnect = if (@hasDecl(T, "failToConnect"))
+            struct {
+                fn f(ptr: *anyopaque, session: *Session, peer: *upstream.Peer, err_val: ProxyError, ctx: ?*anyopaque) ProxyError {
+                    const self: *T = @ptrCast(@alignCast(ptr));
+                    return self.failToConnect(session, peer, err_val, ctx);
+                }
+            }.f
+        else
+            struct {
+                fn f(_: *anyopaque, _: *Session, _: *upstream.Peer, err_val: ProxyError, _: ?*anyopaque) ProxyError {
+                    return err_val;
+                }
+            }.f;
+
+        const failToProxy = if (@hasDecl(T, "failToProxy"))
+            struct {
+                fn f(ptr: *anyopaque, session: *Session, err_val: ProxyError, ctx: ?*anyopaque) FailToProxy {
+                    const self: *T = @ptrCast(@alignCast(ptr));
+                    return self.failToProxy(session, err_val, ctx);
+                }
+            }.f
+        else
+            struct {
+                fn f(_: *anyopaque, _: *Session, err_val: ProxyError, _: ?*anyopaque) FailToProxy {
+                    const code: u16 = switch (err_val) {
+                        ProxyError.UpstreamConnectionFailed, ProxyError.UpstreamError, ProxyError.UpstreamTimeout => 502,
+                        ProxyError.NoPeerAvailable => 503,
+                        ProxyError.InvalidRequest => 400,
+                        ProxyError.RequestFiltered => 403,
+                        else => 500,
+                    };
+                    return .{
+                        .error_code = code,
+                        .can_reuse_downstream = false,
+                    };
+                }
+            }.f;
+
+        const isPurge = if (@hasDecl(T, "isPurge"))
+            struct {
+                fn f(ptr: *anyopaque, session: *Session, ctx: ?*anyopaque) bool {
+                    const self: *T = @ptrCast(@alignCast(ptr));
+                    return self.isPurge(session, ctx);
+                }
+            }.f
+        else
+            struct {
+                fn f(_: *anyopaque, _: *Session, _: ?*anyopaque) bool {
+                    return false;
+                }
+            }.f;
+
+        const purgeResponseFilter = if (@hasDecl(T, "purgeResponseFilter"))
+            struct {
+                fn f(ptr: *anyopaque, session: *Session, status: PurgeStatus, response: *http.ResponseHeader, ctx: ?*anyopaque) ProxyError!void {
+                    const self: *T = @ptrCast(@alignCast(ptr));
+                    return self.purgeResponseFilter(session, status, response, ctx);
+                }
+            }.f
+        else
+            struct {
+                fn f(_: *anyopaque, _: *Session, _: PurgeStatus, _: *http.ResponseHeader, _: ?*anyopaque) ProxyError!void {}
+            }.f;
+
         const vtable = ProxyHttp.VTable{
             .newCtx = newCtx,
             .freeCtx = freeCtx,
             .upstreamPeer = upstreamPeer,
+            .earlyRequestFilter = earlyRequestFilter,
             .requestFilter = requestFilter,
+            .requestBodyFilter = requestBodyFilter,
             .upstreamRequestFilter = upstreamRequestFilter,
             .upstreamResponseFilter = upstreamResponseFilter,
+            .responseBodyFilter = responseBodyFilter,
             .responseFilter = responseFilter,
             .loggingFilter = loggingFilter,
             .errorFilter = errorFilter,
             .requestCacheFilter = requestCacheFilter,
+            .cacheKeyCallback = cacheKeyCallback,
+            .cacheMissFilter = cacheMissFilter,
+            .cacheHitFilter = cacheHitFilter,
+            .responseCacheFilter = responseCacheFilter,
+            .proxyUpstreamFilter = proxyUpstreamFilter,
             .shouldRetry = shouldRetry,
+            .failToConnect = failToConnect,
+            .failToProxy = failToProxy,
+            .isPurge = isPurge,
+            .purgeResponseFilter = purgeResponseFilter,
         };
     };
 

@@ -14,6 +14,7 @@ pub const linked_list = @import("linked_list.zig");
 pub const lru = @import("lru.zig");
 pub const tinyufo = @import("tinyufo.zig");
 pub const ketama = @import("ketama.zig");
+pub const digest = @import("digest.zig");
 
 // Re-export commonly used types
 pub const Error = err.Error;
@@ -28,10 +29,20 @@ pub const TinyUfo = tinyufo.TinyUfo;
 pub const Continuum = ketama.Continuum;
 pub const Bucket = ketama.Bucket;
 
+// Digest types
+pub const Digest = digest.Digest;
+pub const TimingDigest = digest.TimingDigest;
+pub const SocketDigest = digest.SocketDigest;
+pub const SslDigest = digest.SslDigest;
+pub const ProxyDigest = digest.ProxyDigest;
+pub const SocketAddr = digest.SocketAddr;
+pub const TcpInfo = digest.TcpInfo;
+
 // Level 1 modules (depend on Level 0)
 pub const limits = @import("limits.zig");
 pub const http = @import("http.zig");
 pub const http_parser = @import("http_parser.zig");
+pub const http_utils = @import("http_utils.zig");
 pub const memory_cache = @import("memory_cache.zig");
 pub const pool = @import("pool.zig");
 
@@ -39,6 +50,14 @@ pub const pool = @import("pool.zig");
 pub const Estimator = limits.Estimator;
 pub const Inflight = limits.Inflight;
 pub const Rate = limits.Rate;
+
+// HTTP utility types
+pub const FixedBuffer = http_utils.FixedBuffer;
+pub const CachedDate = http_utils.CachedDate;
+pub const getCachedDate = http_utils.getCachedDate;
+pub const genErrorResponse = http_utils.genErrorResponse;
+pub const ErrorResponseCode = http_utils.ErrorResponseCode;
+pub const SERVER_NAME = http_utils.SERVER_NAME;
 
 // HTTP types
 pub const RequestHeader = http.RequestHeader;
@@ -162,6 +181,36 @@ pub const DEFAULT_MIN_SIZE = compression.DEFAULT_MIN_SIZE;
 // Level 5 modules (top level) - Proxy Framework
 pub const proxy = @import("proxy.zig");
 
+// HTTP Modules Framework
+pub const http_modules = @import("http_modules.zig");
+
+// gRPC-Web Bridge
+pub const grpc_web = @import("grpc_web.zig");
+
+// Raw CONNECT Protocol
+pub const connect = @import("connect.zig");
+
+// Subrequest Support
+pub const subrequest = @import("subrequest.zig");
+
+// Range Request Support
+pub const range = @import("range.zig");
+
+// Listener Features
+pub const listener = @import("listener.zig");
+
+// Peer Features
+pub const peer = @import("peer.zig");
+
+// Connector Features
+pub const connector = @import("connector.zig");
+
+// Tracing & Observability
+pub const tracing = @import("tracing.zig");
+
+// Server Framework
+pub const server = @import("server.zig");
+
 // HTTP/2 support
 pub const http2 = @import("http2.zig");
 
@@ -172,6 +221,9 @@ pub const websocket = @import("websocket.zig");
 pub const quic = @import("quic.zig");
 pub const http3 = @import("http3.zig");
 pub const quiche_ffi = @import("quiche_ffi.zig");
+
+// Prometheus metrics
+pub const prometheus = @import("prometheus.zig");
 
 // Proxy types
 pub const HttpProxy = proxy.HttpProxy;

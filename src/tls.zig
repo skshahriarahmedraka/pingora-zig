@@ -414,6 +414,195 @@ pub fn freePemBlocks(allocator: Allocator, blocks: []PemBlock) void {
 }
 
 // ============================================================================
+// TLS Backend Selection
+// ============================================================================
+
+/// Available TLS backend implementations
+pub const TlsBackend = enum {
+    /// OpenSSL - most widely used, good compatibility
+    openssl,
+    /// BoringSSL - Google's fork of OpenSSL, used by Chrome
+    boringssl,
+    /// LibreSSL - OpenBSD's fork of OpenSSL
+    libressl,
+    /// s2n-tls - AWS's TLS implementation
+    s2n,
+    /// rustls - Pure Rust TLS implementation (via C bindings)
+    rustls,
+
+    /// Get the currently active TLS backend
+    pub fn current() TlsBackend {
+        // Default to OpenSSL for now
+        // In the future, this can be compile-time configurable
+        return .openssl;
+    }
+
+    /// Get human-readable name
+    pub fn name(self: TlsBackend) []const u8 {
+        return switch (self) {
+            .openssl => "OpenSSL",
+            .boringssl => "BoringSSL",
+            .libressl => "LibreSSL",
+            .s2n => "s2n-tls",
+            .rustls => "rustls",
+        };
+    }
+
+    /// Check if this backend supports a specific feature
+    pub fn supportsFeature(self: TlsBackend, feature: TlsFeature) bool {
+        return switch (feature) {
+            .tls_1_3 => true, // All modern backends support TLS 1.3
+            .session_tickets => true,
+            .ocsp_stapling => self != .rustls, // rustls handles OCSP differently
+            .client_certs => true,
+            .alpn => true,
+            .sni => true,
+            .keylog => self == .openssl or self == .boringssl,
+        };
+    }
+};
+
+/// TLS features that may vary by backend
+pub const TlsFeature = enum {
+    tls_1_3,
+    session_tickets,
+    ocsp_stapling,
+    client_certs,
+    alpn,
+    sni,
+    keylog,
+};
+
+/// BoringSSL-specific configuration
+/// BoringSSL is Google's fork of OpenSSL with enhanced security and performance
+pub const BoringSSLConfig = struct {
+    /// Enable or disable specific cipher suites
+    cipher_suites: ?[]const u8 = null,
+    /// Enable GREASE (Generate Random Extensions And Sustain Extensibility)
+    enable_grease: bool = true,
+    /// Enable encrypted client hello (ECH)
+    enable_ech: bool = false,
+    /// ECH config list (base64 encoded)
+    ech_config_list: ?[]const u8 = null,
+    /// Enable CECPQ2 (post-quantum key exchange)
+    enable_cecpq2: bool = false,
+    /// Trust anchor path
+    trust_anchor_path: ?[]const u8 = null,
+
+    pub fn init() BoringSSLConfig {
+        return .{};
+    }
+};
+
+/// s2n-tls specific configuration
+/// s2n-tls is AWS's TLS implementation focused on security and simplicity
+pub const S2nConfig = struct {
+    /// Security policy (e.g., "default_tls13", "20230317")
+    security_policy: []const u8 = "default_tls13",
+    /// Enable client authentication
+    client_auth: ClientAuthMode = .none,
+    /// Maximum certificate chain depth
+    max_chain_depth: u8 = 10,
+    /// Enable OCSP stapling
+    enable_ocsp: bool = true,
+
+    pub const ClientAuthMode = enum {
+        none,
+        optional,
+        required,
+    };
+
+    pub fn init() S2nConfig {
+        return .{};
+    }
+};
+
+/// rustls specific configuration
+/// rustls is a modern TLS library written in Rust
+pub const RustlsConfig = struct {
+    /// Root certificate store
+    root_store: RootStore = .webpki,
+    /// Enable or disable specific TLS versions
+    min_version: TlsVersion = .tls_1_2,
+    max_version: TlsVersion = .tls_1_3,
+    /// ALPN protocols
+    alpn_protocols: []const []const u8 = &.{},
+
+    pub const RootStore = enum {
+        /// Use webpki-roots (Mozilla's root certificates)
+        webpki,
+        /// Use native system root store
+        native,
+        /// Custom root store
+        custom,
+    };
+
+    pub fn init() RustlsConfig {
+        return .{};
+    }
+};
+
+/// Unified TLS configuration that works with any backend
+pub const UnifiedTlsConfig = struct {
+    backend: TlsBackend = .openssl,
+    min_version: TlsVersion = .tls_1_2,
+    max_version: TlsVersion = .tls_1_3,
+    cert_path: ?[]const u8 = null,
+    key_path: ?[]const u8 = null,
+    ca_path: ?[]const u8 = null,
+    alpn_protocols: []const []const u8 = &.{},
+    verify_peer: bool = true,
+    sni_hostname: ?[]const u8 = null,
+
+    // Backend-specific configs
+    boringssl: ?BoringSSLConfig = null,
+    s2n: ?S2nConfig = null,
+    rustls: ?RustlsConfig = null,
+
+    pub fn init() UnifiedTlsConfig {
+        return .{};
+    }
+
+    /// Create configuration for server mode
+    pub fn forServer(cert_path: []const u8, key_path: []const u8) UnifiedTlsConfig {
+        return .{
+            .cert_path = cert_path,
+            .key_path = key_path,
+            .verify_peer = false, // Server doesn't verify client by default
+        };
+    }
+
+    /// Create configuration for client mode
+    pub fn forClient(ca_path: ?[]const u8) UnifiedTlsConfig {
+        return .{
+            .ca_path = ca_path,
+            .verify_peer = true,
+        };
+    }
+
+    /// Set the TLS backend
+    pub fn withBackend(self: UnifiedTlsConfig, backend: TlsBackend) UnifiedTlsConfig {
+        var config = self;
+        config.backend = backend;
+        return config;
+    }
+
+    /// Set ALPN protocols
+    pub fn withAlpn(self: UnifiedTlsConfig, protocols: []const []const u8) UnifiedTlsConfig {
+        var config = self;
+        config.alpn_protocols = protocols;
+        return config;
+    }
+
+    /// Set SNI hostname
+    pub fn withSni(self: UnifiedTlsConfig, hostname: []const u8) UnifiedTlsConfig {
+        var config = self;
+        config.sni_hostname = hostname;
+        return config;
+    }
+};
+
+// ============================================================================
 // ALPN Protocol Constants
 // ============================================================================
 
@@ -546,4 +735,74 @@ test "parsePem empty" {
     defer freePemBlocks(testing.allocator, blocks);
 
     try testing.expectEqual(blocks.len, 0);
+}
+
+test "TlsBackend current" {
+    const backend = TlsBackend.current();
+    try testing.expectEqual(TlsBackend.openssl, backend);
+}
+
+test "TlsBackend name" {
+    try testing.expectEqualStrings("OpenSSL", TlsBackend.openssl.name());
+    try testing.expectEqualStrings("BoringSSL", TlsBackend.boringssl.name());
+    try testing.expectEqualStrings("s2n-tls", TlsBackend.s2n.name());
+    try testing.expectEqualStrings("rustls", TlsBackend.rustls.name());
+}
+
+test "TlsBackend supportsFeature" {
+    try testing.expect(TlsBackend.openssl.supportsFeature(.tls_1_3));
+    try testing.expect(TlsBackend.openssl.supportsFeature(.keylog));
+    try testing.expect(TlsBackend.boringssl.supportsFeature(.keylog));
+    try testing.expect(!TlsBackend.rustls.supportsFeature(.keylog));
+    try testing.expect(!TlsBackend.rustls.supportsFeature(.ocsp_stapling));
+}
+
+test "BoringSSLConfig defaults" {
+    const config = BoringSSLConfig.init();
+    try testing.expect(config.enable_grease);
+    try testing.expect(!config.enable_ech);
+    try testing.expect(!config.enable_cecpq2);
+}
+
+test "S2nConfig defaults" {
+    const config = S2nConfig.init();
+    try testing.expectEqualStrings("default_tls13", config.security_policy);
+    try testing.expectEqual(S2nConfig.ClientAuthMode.none, config.client_auth);
+    try testing.expect(config.enable_ocsp);
+}
+
+test "RustlsConfig defaults" {
+    const config = RustlsConfig.init();
+    try testing.expectEqual(RustlsConfig.RootStore.webpki, config.root_store);
+    try testing.expectEqual(TlsVersion.tls_1_2, config.min_version);
+    try testing.expectEqual(TlsVersion.tls_1_3, config.max_version);
+}
+
+test "UnifiedTlsConfig init" {
+    const config = UnifiedTlsConfig.init();
+    try testing.expectEqual(TlsBackend.openssl, config.backend);
+    try testing.expect(config.verify_peer);
+}
+
+test "UnifiedTlsConfig forServer" {
+    const config = UnifiedTlsConfig.forServer("/path/to/cert.pem", "/path/to/key.pem");
+    try testing.expectEqualStrings("/path/to/cert.pem", config.cert_path.?);
+    try testing.expectEqualStrings("/path/to/key.pem", config.key_path.?);
+    try testing.expect(!config.verify_peer);
+}
+
+test "UnifiedTlsConfig forClient" {
+    const config = UnifiedTlsConfig.forClient("/path/to/ca.pem");
+    try testing.expectEqualStrings("/path/to/ca.pem", config.ca_path.?);
+    try testing.expect(config.verify_peer);
+}
+
+test "UnifiedTlsConfig withBackend" {
+    const config = UnifiedTlsConfig.init().withBackend(.boringssl);
+    try testing.expectEqual(TlsBackend.boringssl, config.backend);
+}
+
+test "UnifiedTlsConfig withSni" {
+    const config = UnifiedTlsConfig.init().withSni("example.com");
+    try testing.expectEqualStrings("example.com", config.sni_hostname.?);
 }
