@@ -625,28 +625,26 @@ pub const Headers = struct {
 // URI - Request URI
 // ============================================================================
 
-/// Parsed URI components
-pub const Uri = struct {
+/// Zero-copy parsed URI components - avoids memory allocation by storing slices into original string
+/// This is the high-performance variant for cases where the original string outlives the URI
+pub const ZeroCopyUri = struct {
     raw: []const u8,
     scheme: ?[]const u8,
     authority: ?[]const u8,
     path: []const u8,
     query: ?[]const u8,
-    owned: bool,
-    allocator: ?Allocator,
 
     const Self = @This();
 
-    pub fn parse(allocator: Allocator, raw: []const u8) !Self {
-        const raw_copy = try allocator.dupe(u8, raw);
-        errdefer allocator.free(raw_copy);
-
+    /// Parse a URI without any memory allocation - zero-copy
+    /// The caller must ensure `raw` outlives the returned ZeroCopyUri
+    pub fn parse(raw: []const u8) Self {
         var scheme: ?[]const u8 = null;
         var authority: ?[]const u8 = null;
-        var path: []const u8 = raw_copy;
+        var path: []const u8 = raw;
         var query: ?[]const u8 = null;
 
-        var remaining = raw_copy;
+        var remaining = raw;
 
         // Check for scheme (e.g., "http://")
         if (std.mem.indexOf(u8, remaining, "://")) |scheme_end| {
@@ -659,8 +657,16 @@ pub const Uri = struct {
                 remaining = remaining[path_start..];
             } else {
                 authority = remaining;
-                remaining = remaining[remaining.len..]; // empty slice
+                // No path after authority - use "/" as default
                 path = "/";
+                // No query possible without path
+                return .{
+                    .raw = raw,
+                    .scheme = scheme,
+                    .authority = authority,
+                    .path = path,
+                    .query = null,
+                };
             }
         }
 
@@ -673,11 +679,131 @@ pub const Uri = struct {
         }
 
         return .{
-            .raw = raw_copy,
+            .raw = raw,
             .scheme = scheme,
             .authority = authority,
             .path = path,
             .query = query,
+        };
+    }
+
+    /// No-op deinit for API compatibility - zero-copy means no cleanup needed
+    pub fn deinit(self: *Self) void {
+        _ = self;
+    }
+
+    /// Get path and query string combined
+    pub fn pathAndQuery(self: *const Self) []const u8 {
+        if (self.query) |_| {
+            // Return from path start to end of query
+            const path_ptr = @intFromPtr(self.path.ptr);
+            const raw_ptr = @intFromPtr(self.raw.ptr);
+            const path_offset = path_ptr - raw_ptr;
+            return self.raw[path_offset..];
+        }
+        return self.path;
+    }
+
+    /// Extract the host (without port) from the authority - zero-copy
+    pub fn host(self: *const Self) ?[]const u8 {
+        const auth = self.authority orelse return null;
+        // Check for IPv6 address format [host]:port
+        if (std.mem.indexOfScalar(u8, auth, '[')) |bracket_start| {
+            if (std.mem.indexOfScalar(u8, auth, ']')) |bracket_end| {
+                // IPv6: return content between brackets
+                return auth[bracket_start + 1 .. bracket_end];
+            }
+        }
+        // Regular host:port or just host
+        if (std.mem.lastIndexOfScalar(u8, auth, ':')) |colon_pos| {
+            return auth[0..colon_pos];
+        }
+        return auth;
+    }
+
+    /// Extract the port from the authority, or return default based on scheme
+    pub fn port(self: *const Self) u16 {
+        if (self.authority) |auth| {
+            // Check for IPv6 address format [host]:port
+            if (std.mem.indexOfScalar(u8, auth, ']')) |bracket_end| {
+                // Port comes after ]:
+                if (bracket_end + 1 < auth.len and auth[bracket_end + 1] == ':') {
+                    const port_str = auth[bracket_end + 2 ..];
+                    return std.fmt.parseInt(u16, port_str, 10) catch self.defaultPort();
+                }
+                return self.defaultPort();
+            }
+            // Regular host:port
+            if (std.mem.lastIndexOfScalar(u8, auth, ':')) |colon_pos| {
+                const port_str = auth[colon_pos + 1 ..];
+                return std.fmt.parseInt(u16, port_str, 10) catch self.defaultPort();
+            }
+        }
+        return self.defaultPort();
+    }
+
+    /// Get the default port based on the scheme
+    fn defaultPort(self: *const Self) u16 {
+        if (self.scheme) |s| {
+            if (std.mem.eql(u8, s, "https")) return 443;
+            if (std.mem.eql(u8, s, "http")) return 80;
+            if (std.mem.eql(u8, s, "ws")) return 80;
+            if (std.mem.eql(u8, s, "wss")) return 443;
+        }
+        return 80;
+    }
+
+    /// Convert to owned Uri (allocates memory)
+    pub fn toOwned(self: *const Self, allocator: Allocator) !Uri {
+        return Uri.parse(allocator, self.raw);
+    }
+};
+
+/// Parsed URI components (allocating version)
+pub const Uri = struct {
+    raw: []const u8,
+    scheme: ?[]const u8,
+    authority: ?[]const u8,
+    path: []const u8,
+    query: ?[]const u8,
+    owned: bool,
+    allocator: ?Allocator,
+
+    const Self = @This();
+
+    /// Parse a URI with memory allocation (copies the input string)
+    pub fn parse(allocator: Allocator, raw: []const u8) !Self {
+        const raw_copy = try allocator.dupe(u8, raw);
+        errdefer allocator.free(raw_copy);
+
+        // Use zero-copy parser on the copied data
+        const zc = ZeroCopyUri.parse(raw_copy);
+
+        // The zc slices already point into raw_copy, so use them directly
+        // Exception: path "/" literal for authority-only URIs
+        return .{
+            .raw = raw_copy,
+            .scheme = zc.scheme,
+            .authority = zc.authority,
+            .path = zc.path,
+            .query = zc.query,
+            .owned = true,
+            .allocator = allocator,
+        };
+    }
+
+    /// Create a Uri from a zero-copy parse result (takes ownership of raw string)
+    pub fn fromZeroCopy(allocator: Allocator, raw: []const u8) !Self {
+        const raw_copy = try allocator.dupe(u8, raw);
+        const zc = ZeroCopyUri.parse(raw_copy);
+
+        // The zc slices already point into raw_copy, so use them directly
+        return .{
+            .raw = raw_copy,
+            .scheme = zc.scheme,
+            .authority = zc.authority,
+            .path = zc.path,
+            .query = zc.query,
             .owned = true,
             .allocator = allocator,
         };
@@ -700,6 +826,55 @@ pub const Uri = struct {
             return self.raw[path_offset..];
         }
         return self.path;
+    }
+
+    /// Extract the host (without port) from the authority
+    pub fn host(self: *const Self) ?[]const u8 {
+        const auth = self.authority orelse return null;
+        // Check for IPv6 address format [host]:port
+        if (std.mem.indexOfScalar(u8, auth, '[')) |bracket_start| {
+            if (std.mem.indexOfScalar(u8, auth, ']')) |bracket_end| {
+                // IPv6: return content between brackets
+                return auth[bracket_start + 1 .. bracket_end];
+            }
+        }
+        // Regular host:port or just host
+        if (std.mem.lastIndexOfScalar(u8, auth, ':')) |colon_pos| {
+            return auth[0..colon_pos];
+        }
+        return auth;
+    }
+
+    /// Extract the port from the authority, or return default based on scheme
+    pub fn port(self: *const Self) u16 {
+        if (self.authority) |auth| {
+            // Check for IPv6 address format [host]:port
+            if (std.mem.indexOfScalar(u8, auth, ']')) |bracket_end| {
+                // Port comes after ]:
+                if (bracket_end + 1 < auth.len and auth[bracket_end + 1] == ':') {
+                    const port_str = auth[bracket_end + 2 ..];
+                    return std.fmt.parseInt(u16, port_str, 10) catch self.defaultPort();
+                }
+                return self.defaultPort();
+            }
+            // Regular host:port
+            if (std.mem.lastIndexOfScalar(u8, auth, ':')) |colon_pos| {
+                const port_str = auth[colon_pos + 1 ..];
+                return std.fmt.parseInt(u16, port_str, 10) catch self.defaultPort();
+            }
+        }
+        return self.defaultPort();
+    }
+
+    /// Get the default port based on the scheme
+    fn defaultPort(self: *const Self) u16 {
+        if (self.scheme) |s| {
+            if (std.mem.eql(u8, s, "https")) return 443;
+            if (std.mem.eql(u8, s, "http")) return 80;
+            if (std.mem.eql(u8, s, "ws")) return 80;
+            if (std.mem.eql(u8, s, "wss")) return 443;
+        }
+        return 80;
     }
 };
 
@@ -1261,5 +1436,161 @@ test "Uri pathAndQuery reconstruction" {
 
     const pq = uri.pathAndQuery();
     try testing.expectEqualStrings("/path?a=1&b=2", pq);
+}
+
+test "Uri port parsing with explicit port" {
+    var uri = try Uri.parse(testing.allocator, "http://example.com:8080/path");
+    defer uri.deinit();
+
+    try testing.expectEqualStrings("example.com", uri.host().?);
+    try testing.expectEqual(@as(u16, 8080), uri.port());
+}
+
+test "Uri port parsing with default http port" {
+    var uri = try Uri.parse(testing.allocator, "http://example.com/path");
+    defer uri.deinit();
+
+    try testing.expectEqualStrings("example.com", uri.host().?);
+    try testing.expectEqual(@as(u16, 80), uri.port());
+}
+
+test "Uri port parsing with default https port" {
+    var uri = try Uri.parse(testing.allocator, "https://secure.example.com/path");
+    defer uri.deinit();
+
+    try testing.expectEqualStrings("secure.example.com", uri.host().?);
+    try testing.expectEqual(@as(u16, 443), uri.port());
+}
+
+test "Uri port parsing with IPv6 address" {
+    var uri = try Uri.parse(testing.allocator, "http://[::1]:9000/path");
+    defer uri.deinit();
+
+    try testing.expectEqualStrings("::1", uri.host().?);
+    try testing.expectEqual(@as(u16, 9000), uri.port());
+}
+
+test "Uri port parsing with IPv6 no port" {
+    var uri = try Uri.parse(testing.allocator, "http://[2001:db8::1]/path");
+    defer uri.deinit();
+
+    try testing.expectEqualStrings("2001:db8::1", uri.host().?);
+    try testing.expectEqual(@as(u16, 80), uri.port());
+}
+
+test "Uri host and port for websocket" {
+    var uri = try Uri.parse(testing.allocator, "wss://ws.example.com/socket");
+    defer uri.deinit();
+
+    try testing.expectEqualStrings("ws.example.com", uri.host().?);
+    try testing.expectEqual(@as(u16, 443), uri.port());
+}
+
+// ============================================================================
+// ZeroCopyUri Tests - Zero-allocation URI parsing
+// ============================================================================
+
+test "ZeroCopyUri parse simple path - zero allocation" {
+    const raw = "/path/to/resource";
+    var uri = ZeroCopyUri.parse(raw);
+    defer uri.deinit(); // No-op but API compatible
+
+    try testing.expect(uri.scheme == null);
+    try testing.expect(uri.authority == null);
+    try testing.expectEqualStrings("/path/to/resource", uri.path);
+    try testing.expect(uri.query == null);
+    // Verify zero-copy: pointers should be into original string
+    try testing.expect(uri.path.ptr == raw.ptr);
+}
+
+test "ZeroCopyUri parse with query - zero allocation" {
+    const raw = "/search?q=test&page=1";
+    var uri = ZeroCopyUri.parse(raw);
+    defer uri.deinit();
+
+    try testing.expectEqualStrings("/search", uri.path);
+    try testing.expectEqualStrings("q=test&page=1", uri.query.?);
+    // Verify zero-copy
+    try testing.expect(uri.path.ptr == raw.ptr);
+}
+
+test "ZeroCopyUri parse full url - zero allocation" {
+    const raw = "http://example.com/path?query=1";
+    var uri = ZeroCopyUri.parse(raw);
+    defer uri.deinit();
+
+    try testing.expectEqualStrings("http", uri.scheme.?);
+    try testing.expectEqualStrings("example.com", uri.authority.?);
+    try testing.expectEqualStrings("/path", uri.path);
+    try testing.expectEqualStrings("query=1", uri.query.?);
+}
+
+test "ZeroCopyUri pathAndQuery" {
+    const raw = "/path?a=1&b=2";
+    var uri = ZeroCopyUri.parse(raw);
+    defer uri.deinit();
+
+    const pq = uri.pathAndQuery();
+    try testing.expectEqualStrings("/path?a=1&b=2", pq);
+}
+
+test "ZeroCopyUri host extraction" {
+    const raw = "http://example.com:8080/path";
+    var uri = ZeroCopyUri.parse(raw);
+    defer uri.deinit();
+
+    try testing.expectEqualStrings("example.com", uri.host().?);
+    try testing.expectEqual(@as(u16, 8080), uri.port());
+}
+
+test "ZeroCopyUri IPv6 host and port" {
+    const raw = "http://[::1]:9000/path";
+    var uri = ZeroCopyUri.parse(raw);
+    defer uri.deinit();
+
+    try testing.expectEqualStrings("::1", uri.host().?);
+    try testing.expectEqual(@as(u16, 9000), uri.port());
+}
+
+test "ZeroCopyUri default port by scheme" {
+    const https_raw = "https://secure.example.com/path";
+    var https_uri = ZeroCopyUri.parse(https_raw);
+    defer https_uri.deinit();
+    try testing.expectEqual(@as(u16, 443), https_uri.port());
+
+    const http_raw = "http://example.com/path";
+    var http_uri = ZeroCopyUri.parse(http_raw);
+    defer http_uri.deinit();
+    try testing.expectEqual(@as(u16, 80), http_uri.port());
+
+    const wss_raw = "wss://ws.example.com/socket";
+    var wss_uri = ZeroCopyUri.parse(wss_raw);
+    defer wss_uri.deinit();
+    try testing.expectEqual(@as(u16, 443), wss_uri.port());
+}
+
+test "ZeroCopyUri authority only (no path)" {
+    const raw = "http://example.com";
+    var uri = ZeroCopyUri.parse(raw);
+    defer uri.deinit();
+
+    try testing.expectEqualStrings("http", uri.scheme.?);
+    try testing.expectEqualStrings("example.com", uri.authority.?);
+    try testing.expectEqualStrings("/", uri.path);
+    try testing.expect(uri.query == null);
+}
+
+test "ZeroCopyUri toOwned conversion" {
+    const raw = "http://example.com/path?query=1";
+    var zc_uri = ZeroCopyUri.parse(raw);
+    defer zc_uri.deinit();
+
+    var owned_uri = try zc_uri.toOwned(testing.allocator);
+    defer owned_uri.deinit();
+
+    try testing.expectEqualStrings("http", owned_uri.scheme.?);
+    try testing.expectEqualStrings("example.com", owned_uri.authority.?);
+    try testing.expectEqualStrings("/path", owned_uri.path);
+    try testing.expectEqualStrings("query=1", owned_uri.query.?);
 }
 

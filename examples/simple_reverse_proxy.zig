@@ -11,7 +11,7 @@
 //!   curl http://localhost:8080/
 
 const std = @import("std");
-const pingora = @import("../src/lib.zig");
+const pingora = @import("pingora");
 
 const http = pingora.http;
 const http_parser = pingora.http_parser;
@@ -53,36 +53,38 @@ pub const SimpleReverseProxy = struct {
             return error.InvalidRequest;
         }
 
-        // Build upstream request
-        var upstream_request = std.ArrayList(u8).init(self.allocator);
-        defer upstream_request.deinit();
-
-        const writer = upstream_request.writer();
+        // Build upstream request using a fixed buffer
+        var upstream_buf: [8192]u8 = undefined;
+        var upstream_len: usize = 0;
 
         // Request line
-        try writer.print("{s} {s} HTTP/1.1\r\n", .{
+        const request_line = std.fmt.bufPrint(upstream_buf[upstream_len..], "{s} {s} HTTP/1.1\r\n", .{
             parsed.?.method,
             parsed.?.path,
-        });
+        }) catch return error.BufferTooSmall;
+        upstream_len += request_line.len;
 
         // Forward headers, replacing Host
         for (parsed.?.headers) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "Host")) {
-                try writer.print("Host: {s}:{d}\r\n", .{
+                const host_header = std.fmt.bufPrint(upstream_buf[upstream_len..], "Host: {s}:{d}\r\n", .{
                     self.config.upstream_host,
                     self.config.upstream_port,
-                });
+                }) catch return error.BufferTooSmall;
+                upstream_len += host_header.len;
             } else {
-                try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
+                const fwd_header = std.fmt.bufPrint(upstream_buf[upstream_len..], "{s}: {s}\r\n", .{ header.name, header.value }) catch return error.BufferTooSmall;
+                upstream_len += fwd_header.len;
             }
         }
 
         // Add proxy headers
-        try writer.writeAll("X-Forwarded-By: pingora-zig\r\n");
-        try writer.writeAll("\r\n");
+        const proxy_header = "X-Forwarded-By: pingora-zig\r\n\r\n";
+        @memcpy(upstream_buf[upstream_len..][0..proxy_header.len], proxy_header);
+        upstream_len += proxy_header.len;
 
         // Connect to upstream and send request
-        const response = try self.sendToUpstream(upstream_request.items);
+        const response = try self.sendToUpstream(upstream_buf[0..upstream_len]);
         return response;
     }
 
@@ -105,34 +107,36 @@ pub const SimpleReverseProxy = struct {
         };
 
         // Read response
-        var response = std.ArrayList(u8).init(self.allocator);
-        errdefer response.deinit();
+        var response: std.ArrayListUnmanaged(u8) = .{};
+        errdefer response.deinit(self.allocator);
 
         var buf: [8192]u8 = undefined;
         while (true) {
             const n = stream.read(&buf) catch break;
             if (n == 0) break;
-            try response.appendSlice(buf[0..n]);
+            try response.appendSlice(self.allocator, buf[0..n]);
 
             // Check if we've received complete response
             if (std.mem.indexOf(u8, response.items, "\r\n\r\n")) |header_end| {
                 // Check for Content-Length
                 var resp_headers: [http_parser.MAX_HEADERS]http_parser.HeaderRef = undefined;
-                if (http_parser.parseResponseFull(response.items, &resp_headers)) |parsed_resp| {
-                    if (http_parser.findContentLength(parsed_resp.headers)) |content_length| {
-                        const body_start = header_end + 4;
-                        const body_len = response.items.len - body_start;
-                        if (body_len >= content_length) break;
+                if (http_parser.parseResponseFull(response.items, &resp_headers)) |maybe_parsed| {
+                    if (maybe_parsed) |parsed_resp| {
+                        if (http_parser.findContentLength(parsed_resp.headers)) |content_length| {
+                            const body_start = header_end + 4;
+                            const body_len = response.items.len - body_start;
+                            if (body_len >= content_length) break;
+                        }
                     }
                 } else |_| {}
             }
         }
 
-        return response.toOwnedSlice();
+        return response.toOwnedSlice(self.allocator);
     }
 
     /// Add security headers to response
-    pub fn addSecurityHeaders(response: *std.ArrayList(u8)) !void {
+    pub fn addSecurityHeaders(allocator: std.mem.Allocator, response: *std.ArrayListUnmanaged(u8)) !void {
         // Find end of headers
         if (std.mem.indexOf(u8, response.items, "\r\n\r\n")) |pos| {
             const security_headers =
@@ -140,7 +144,7 @@ pub const SimpleReverseProxy = struct {
                 "X-Frame-Options: DENY\r\n" ++
                 "X-XSS-Protection: 1; mode=block\r\n";
 
-            try response.insertSlice(pos + 2, security_headers);
+            try response.insertSlice(allocator, pos + 2, security_headers);
         }
     }
 };

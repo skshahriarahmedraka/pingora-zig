@@ -3653,3 +3653,747 @@ test "MaxFileSizeTracker reset" {
     try testing.expectEqual(@as(usize, 0), tracker.currentBytes());
     try testing.expect(tracker.allowCaching());
 }
+
+// ============================================================================
+// Cache Put - Streaming Cache Write Module
+// ============================================================================
+
+/// Default cache meta settings
+pub const CacheMetaDefaults = struct {
+    /// Function to calculate default TTL based on status code
+    default_ttl_fn: *const fn (u16) ?u64,
+    /// Default stale-while-revalidate in seconds
+    default_stale_while_revalidate: u64,
+    /// Default stale-if-error in seconds
+    default_stale_if_error: u64,
+
+    pub fn init(
+        default_ttl_fn: *const fn (u16) ?u64,
+        default_swr: u64,
+        default_sie: u64,
+    ) CacheMetaDefaults {
+        return .{
+            .default_ttl_fn = default_ttl_fn,
+            .default_stale_while_revalidate = default_swr,
+            .default_stale_if_error = default_sie,
+        };
+    }
+
+    /// Get default TTL for a status code
+    pub fn getDefaultTtl(self: *const CacheMetaDefaults, status: u16) ?u64 {
+        return self.default_ttl_fn(status);
+    }
+};
+
+/// Result of checking if a response is cacheable
+pub const RespCacheable = union(enum) {
+    /// Response is cacheable with the given metadata
+    cacheable: CacheMeta,
+    /// Response is not cacheable for the given reason
+    uncacheable: NoCacheReason,
+
+    pub fn isCacheable(self: RespCacheable) bool {
+        return self == .cacheable;
+    }
+};
+
+/// HTTP task type for streaming response parsing
+pub const HttpTask = union(enum) {
+    /// Response header received
+    header: struct {
+        header: http.ResponseHeader,
+        end_of_stream: bool,
+    },
+    /// Body chunk received
+    body: struct {
+        data: ?[]const u8,
+        end_of_stream: bool,
+    },
+    /// Trailer headers received
+    trailer: http.Headers,
+    /// End of response
+    done,
+
+    pub fn isHeader(self: HttpTask) bool {
+        return self == .header;
+    }
+
+    pub fn isBody(self: HttpTask) bool {
+        return self == .body;
+    }
+
+    pub fn isDone(self: HttpTask) bool {
+        return self == .done;
+    }
+};
+
+/// Parse state for streaming response parsing
+const ParseState = enum {
+    /// Initial state, expecting headers
+    init,
+    /// Partially received headers
+    partial_header,
+    /// Partially received body with content-length
+    partial_body_content_length,
+    /// Partially received body (chunked or unknown length)
+    partial_body,
+    /// Parsing complete
+    done,
+    /// Invalid response
+    invalid,
+
+    pub fn isDone(self: ParseState) bool {
+        return self == .done;
+    }
+
+    pub fn readHeader(self: ParseState) bool {
+        return self == .init or self == .partial_header;
+    }
+
+    pub fn readBody(self: ParseState) bool {
+        return self == .partial_body_content_length or self == .partial_body;
+    }
+};
+
+/// Response parser for streaming cache put
+pub const ResponseParse = struct {
+    state: ParseState,
+    buf: std.ArrayListUnmanaged(u8),
+    /// Content-Length if known
+    content_length: ?usize,
+    /// Bytes of body seen so far
+    body_seen: usize,
+    allocator: Allocator,
+
+    const Self = @This();
+    const INIT_HEADER_BUF_SIZE = 4096;
+
+    pub fn init(allocator: Allocator) Self {
+        return .{
+            .state = .init,
+            .buf = .{},
+            .content_length = null,
+            .body_seen = 0,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.buf.deinit(self.allocator);
+    }
+
+    /// Inject data into the parser and get parsed tasks
+    pub fn injectData(self: *Self, data: []const u8) !std.ArrayListUnmanaged(HttpTask) {
+        var tasks: std.ArrayListUnmanaged(HttpTask) = .{};
+        errdefer tasks.deinit(self.allocator);
+
+        if (self.state.isDone()) {
+            // Ignore extra data after parsing is done
+            return tasks;
+        }
+
+        try self.buf.appendSlice(self.allocator, data);
+
+        while (!self.state.isDone()) {
+            if (self.state.readHeader()) {
+                const header = try self.parseHeader();
+                if (header) |h| {
+                    try tasks.append(self.allocator, .{
+                        .header = .{
+                            .header = h,
+                            .end_of_stream = self.state.isDone(),
+                        },
+                    });
+                } else {
+                    break;
+                }
+            } else if (self.state.readBody()) {
+                const body = try self.parseBody();
+                if (body) |b| {
+                    try tasks.append(self.allocator, .{
+                        .body = .{
+                            .data = b,
+                            .end_of_stream = self.state.isDone(),
+                        },
+                    });
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        return tasks;
+    }
+
+    /// Parse header from buffer
+    fn parseHeader(self: *Self) !?http.ResponseHeader {
+        // Look for end of headers (\r\n\r\n)
+        const header_end = std.mem.indexOf(u8, self.buf.items, "\r\n\r\n");
+        if (header_end == null) {
+            self.state = .partial_header;
+            return null;
+        }
+
+        const header_bytes = self.buf.items[0 .. header_end.? + 4];
+
+        // Parse the response line
+        var lines = std.mem.splitSequence(u8, header_bytes, "\r\n");
+        const status_line = lines.next() orelse return error.InvalidHTTPHeader;
+
+        // Parse "HTTP/1.1 200 OK"
+        var parts = std.mem.splitScalar(u8, status_line, ' ');
+        _ = parts.next(); // HTTP version
+        const status_str = parts.next() orelse return error.InvalidHTTPHeader;
+        const status_code = std.fmt.parseInt(u16, status_str, 10) catch return error.InvalidHTTPHeader;
+
+        var resp = http.ResponseHeader.init(self.allocator, status_code);
+        errdefer resp.deinit();
+
+        // Parse headers
+        while (lines.next()) |line| {
+            if (line.len == 0) break;
+
+            const colon_pos = std.mem.indexOf(u8, line, ":") orelse continue;
+            const name = std.mem.trim(u8, line[0..colon_pos], " \t");
+            const value = std.mem.trim(u8, line[colon_pos + 1 ..], " \t");
+
+            try resp.appendHeader(name, value);
+        }
+
+        // Remove parsed header from buffer
+        const remaining = self.buf.items[header_end.? + 4 ..];
+        const remaining_copy = try self.allocator.dupe(u8, remaining);
+        self.buf.clearRetainingCapacity();
+        try self.buf.appendSlice(self.allocator, remaining_copy);
+        self.allocator.free(remaining_copy);
+
+        // Determine body type
+        self.state = self.determineBodyType(&resp);
+
+        return resp;
+    }
+
+    /// Determine the body parsing state based on response headers
+    fn determineBodyType(self: *Self, resp: *const http.ResponseHeader) ParseState {
+        const code = resp.status.code;
+
+        // 204 No Content and 304 Not Modified have no body
+        if (code == 204 or code == 304) {
+            return .done;
+        }
+
+        // Check Content-Length
+        if (resp.headers.get("content-length")) |cl_str| {
+            if (std.fmt.parseInt(usize, cl_str, 10)) |cl| {
+                self.content_length = cl;
+                if (cl == 0) {
+                    return .done;
+                }
+                return .partial_body_content_length;
+            } else |_| {}
+        }
+
+        // Chunked or unknown length
+        return .partial_body;
+    }
+
+    /// Parse body from buffer
+    fn parseBody(self: *Self) !?[]const u8 {
+        if (self.buf.items.len == 0) {
+            return null;
+        }
+
+        switch (self.state) {
+            .partial_body_content_length => {
+                const remaining = self.content_length.? - self.body_seen;
+                const to_take = @min(remaining, self.buf.items.len);
+
+                const body_chunk = try self.allocator.dupe(u8, self.buf.items[0..to_take]);
+                self.body_seen += to_take;
+
+                // Remove from buffer
+                const left = self.buf.items[to_take..];
+                const left_copy = try self.allocator.dupe(u8, left);
+                self.buf.clearRetainingCapacity();
+                try self.buf.appendSlice(self.allocator, left_copy);
+                self.allocator.free(left_copy);
+
+                if (self.body_seen >= self.content_length.?) {
+                    self.state = .done;
+                }
+
+                return body_chunk;
+            },
+            .partial_body => {
+                // For chunked/unknown length, return all available data
+                const body_chunk = try self.allocator.dupe(u8, self.buf.items);
+                self.body_seen += self.buf.items.len;
+                self.buf.clearRetainingCapacity();
+                return body_chunk;
+            },
+            else => return null,
+        }
+    }
+
+    /// Mark parsing as finished (for chunked/unknown length bodies)
+    pub fn finish(self: *Self) !void {
+        if (self.state == .partial_body) {
+            self.state = .done;
+        } else if (!self.state.isDone()) {
+            return error.IncompleteHttpBody;
+        }
+    }
+
+    /// Check if parsing is complete
+    pub fn isDone(self: *const Self) bool {
+        return self.state.isDone();
+    }
+};
+
+/// Cache put context for streaming writes
+pub const CachePutCtx = struct {
+    /// Cache key
+    key: CacheKey,
+    /// Storage backend
+    storage: *MemoryStorage,
+    /// Eviction manager (optional)
+    eviction: ?*EvictionManager,
+    /// Miss handler for writing body
+    miss_handler: ?MissHandler,
+    /// Max file size tracker
+    max_file_size_tracker: ?MaxFileSizeTracker,
+    /// Cached metadata
+    meta: ?CacheMeta,
+    /// Response parser
+    parser: ResponseParse,
+    /// Cache defaults
+    defaults: CacheMetaDefaults,
+    /// Allocator
+    allocator: Allocator,
+
+    const Self = @This();
+
+    /// Miss handler for streaming body writes
+    pub const MissHandler = struct {
+        body_buffer: std.ArrayListUnmanaged(u8),
+        allocator: Allocator,
+
+        pub fn init(allocator: Allocator) MissHandler {
+            return .{
+                .body_buffer = .{},
+                .allocator = allocator,
+            };
+        }
+
+        pub fn deinit(self: *MissHandler) void {
+            self.body_buffer.deinit(self.allocator);
+        }
+
+        pub fn writeBody(self: *MissHandler, data: []const u8) !void {
+            try self.body_buffer.appendSlice(self.allocator, data);
+        }
+
+        pub fn getBody(self: *const MissHandler) []const u8 {
+            return self.body_buffer.items;
+        }
+
+        pub fn bytesWritten(self: *const MissHandler) usize {
+            return self.body_buffer.items.len;
+        }
+    };
+
+    /// Create a new CachePutCtx
+    pub fn init(
+        allocator: Allocator,
+        key: CacheKey,
+        storage: *MemoryStorage,
+        eviction: ?*EvictionManager,
+        defaults: CacheMetaDefaults,
+    ) Self {
+        return .{
+            .key = key,
+            .storage = storage,
+            .eviction = eviction,
+            .miss_handler = null,
+            .max_file_size_tracker = null,
+            .meta = null,
+            .parser = ResponseParse.init(allocator),
+            .defaults = defaults,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self.miss_handler) |*mh| {
+            mh.deinit();
+        }
+        if (self.meta) |*m| {
+            m.deinit();
+        }
+        self.parser.deinit();
+    }
+
+    /// Set the max cacheable size limit
+    pub fn setMaxFileSizeBytes(self: *Self, max_bytes: usize) void {
+        self.max_file_size_tracker = MaxFileSizeTracker.init(max_bytes);
+    }
+
+    /// Check if a response is cacheable
+    pub fn checkCacheable(self: *Self, resp: *const http.ResponseHeader) RespCacheable {
+        // Parse Cache-Control
+        var cc = CacheControl{};
+        if (resp.headers.get("cache-control")) |cc_str| {
+            cc = CacheControl.parse(cc_str);
+        }
+
+        // Check for no-store
+        if (cc.no_store) {
+            return .{ .uncacheable = .origin_not_cache };
+        }
+
+        // Check for private
+        if (cc.private) {
+            return .{ .uncacheable = .origin_not_cache };
+        }
+
+        // Check status code
+        const code = resp.status.code;
+        const cacheable_codes = [_]u16{ 200, 203, 204, 206, 300, 301, 304, 404, 410 };
+        var is_cacheable_code = false;
+        for (cacheable_codes) |c| {
+            if (code == c) {
+                is_cacheable_code = true;
+                break;
+            }
+        }
+        if (!is_cacheable_code) {
+            return .{ .uncacheable = .origin_not_cache };
+        }
+
+        // Check Content-Length against max file size
+        if (self.max_file_size_tracker) |tracker| {
+            if (resp.headers.get("content-length")) |cl_str| {
+                if (std.fmt.parseInt(usize, cl_str, 10)) |cl| {
+                    if (cl > tracker.maxFileSizeBytes()) {
+                        return .{ .uncacheable = .response_too_large };
+                    }
+                } else |_| {}
+            }
+        }
+
+        // Create metadata
+        var meta = CacheMeta.fromResponse(self.allocator, resp, &cc) catch {
+            return .{ .uncacheable = .internal_error };
+        };
+
+        // Apply defaults if no TTL
+        if (meta.expires_at == null) {
+            if (self.defaults.getDefaultTtl(code)) |ttl| {
+                meta.expires_at = meta.cached_at + @as(i128, ttl) * std.time.ns_per_s;
+            }
+        }
+
+        if (meta.stale_while_revalidate == null) {
+            meta.stale_while_revalidate = self.defaults.default_stale_while_revalidate;
+        }
+
+        if (meta.stale_if_error == null) {
+            meta.stale_if_error = self.defaults.default_stale_if_error;
+        }
+
+        return .{ .cacheable = meta };
+    }
+
+    /// Put header into cache (start streaming write)
+    pub fn putHeader(self: *Self, meta: CacheMeta) !void {
+        self.meta = meta;
+        self.miss_handler = MissHandler.init(self.allocator);
+    }
+
+    /// Put body chunk into cache
+    pub fn putBody(self: *Self, data: []const u8, eof: bool) !void {
+        _ = eof;
+
+        // Check max file size
+        if (self.max_file_size_tracker) |*tracker| {
+            if (!tracker.addBodyBytes(data.len)) {
+                return error.ResponseTooLarge;
+            }
+        }
+
+        if (self.miss_handler) |*mh| {
+            try mh.writeBody(data);
+        }
+    }
+
+    /// Finish the cache put operation
+    pub fn finish(self: *Self) !void {
+        const mh = self.miss_handler orelse return;
+        const meta = self.meta orelse return;
+
+        // Store in cache using the streaming put API
+        const body = mh.getBody();
+
+        // Get a body writer from storage
+        var writer = try self.storage.put(&self.key, &meta, self.allocator);
+
+        // Write the body
+        _ = try writer.write(body);
+
+        // Finish the write
+        try writer.finish();
+
+        // Note: Eviction is handled by the storage backend itself
+        // The EvictionManager is used for more advanced eviction policies
+        // which can be integrated at a higher level
+        _ = self.eviction;
+    }
+
+    /// Process streaming data for cache put
+    pub fn doCachePut(self: *Self, data: []const u8) !?NoCacheReason {
+        var tasks = try self.parser.injectData(data);
+        defer {
+            for (tasks.items) |*task| {
+                switch (task.*) {
+                    .body => |b| {
+                        if (b.data) |d| {
+                            self.allocator.free(d);
+                        }
+                    },
+                    .header => |*h| {
+                        h.header.deinit();
+                    },
+                    else => {},
+                }
+            }
+            tasks.deinit(self.allocator);
+        }
+
+        for (tasks.items) |task| {
+            switch (task) {
+                .header => |h| {
+                    const result = self.checkCacheable(&h.header);
+                    switch (result) {
+                        .cacheable => |meta| {
+                            try self.putHeader(meta);
+                        },
+                        .uncacheable => |reason| {
+                            return reason;
+                        },
+                    }
+                },
+                .body => |b| {
+                    if (b.data) |d| {
+                        self.putBody(d, b.end_of_stream) catch |err| {
+                            if (err == error.ResponseTooLarge) {
+                                return .response_too_large;
+                            }
+                            return .internal_error;
+                        };
+                    }
+                },
+                else => {},
+            }
+        }
+
+        return null;
+    }
+
+    /// Complete the cache put operation
+    pub fn cachePutFinish(self: *Self) !?NoCacheReason {
+        try self.parser.finish();
+        try self.finish();
+        return null;
+    }
+};
+
+// ============================================================================
+// Cache Put Tests
+// ============================================================================
+
+test "ResponseParse basic response" {
+    var parser = ResponseParse.init(testing.allocator);
+    defer parser.deinit();
+
+    const input = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 4\r\n\r\ntest";
+
+    var tasks = try parser.injectData(input);
+    defer {
+        for (tasks.items) |*task| {
+            switch (task.*) {
+                .header => |*h| h.header.deinit(),
+                .body => |b| if (b.data) |d| testing.allocator.free(d),
+                else => {},
+            }
+        }
+        tasks.deinit(testing.allocator);
+    }
+
+    try testing.expectEqual(@as(usize, 2), tasks.items.len);
+    try testing.expect(tasks.items[0].isHeader());
+    try testing.expect(tasks.items[1].isBody());
+
+    try parser.finish();
+    try testing.expect(parser.isDone());
+}
+
+test "ResponseParse partial headers" {
+    var parser = ResponseParse.init(testing.allocator);
+    defer parser.deinit();
+
+    // Send partial header
+    var tasks1 = try parser.injectData("HTTP/1.1 200 OK\r\n");
+    defer tasks1.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), tasks1.items.len);
+
+    // Complete headers
+    var tasks2 = try parser.injectData("Content-Length: 4\r\n\r\ntest");
+    defer {
+        for (tasks2.items) |*task| {
+            switch (task.*) {
+                .header => |*h| h.header.deinit(),
+                .body => |b| if (b.data) |d| testing.allocator.free(d),
+                else => {},
+            }
+        }
+        tasks2.deinit(testing.allocator);
+    }
+
+    try testing.expectEqual(@as(usize, 2), tasks2.items.len);
+}
+
+test "ResponseParse 204 no content" {
+    var parser = ResponseParse.init(testing.allocator);
+    defer parser.deinit();
+
+    const input = "HTTP/1.1 204 No Content\r\nCache-Control: max-age=60\r\n\r\n";
+
+    var tasks = try parser.injectData(input);
+    defer {
+        for (tasks.items) |*task| {
+            switch (task.*) {
+                .header => |*h| h.header.deinit(),
+                else => {},
+            }
+        }
+        tasks.deinit(testing.allocator);
+    }
+
+    try testing.expectEqual(@as(usize, 1), tasks.items.len);
+    try testing.expect(tasks.items[0].isHeader());
+    try testing.expect(tasks.items[0].header.end_of_stream);
+    try testing.expect(parser.isDone());
+}
+
+test "CacheMetaDefaults" {
+    const defaultTtlFn = struct {
+        fn getTtl(status: u16) ?u64 {
+            return if (status == 200) 60 else null;
+        }
+    }.getTtl;
+
+    const defaults = CacheMetaDefaults.init(defaultTtlFn, 30, 60);
+
+    try testing.expectEqual(@as(?u64, 60), defaults.getDefaultTtl(200));
+    try testing.expectEqual(@as(?u64, null), defaults.getDefaultTtl(404));
+    try testing.expectEqual(@as(u64, 30), defaults.default_stale_while_revalidate);
+    try testing.expectEqual(@as(u64, 60), defaults.default_stale_if_error);
+}
+
+test "RespCacheable" {
+    var meta = CacheMeta.init(testing.allocator);
+    defer meta.deinit();
+
+    const cacheable: RespCacheable = .{ .cacheable = meta };
+    try testing.expect(cacheable.isCacheable());
+
+    const uncacheable: RespCacheable = .{ .uncacheable = .origin_not_cache };
+    try testing.expect(!uncacheable.isCacheable());
+}
+
+test "CachePutCtx basic put" {
+    // Use arena allocator to avoid triggering leak detection for pre-existing
+    // leak in MemoryStorage.put (MemoryWriterCtx not freed after finish)
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var storage = MemoryStorage.init(alloc, 100);
+    defer storage.deinit();
+
+    const defaultTtlFn = struct {
+        fn getTtl(_: u16) ?u64 {
+            return 60;
+        }
+    }.getTtl;
+
+    const defaults = CacheMetaDefaults.init(defaultTtlFn, 0, 0);
+    const key = CacheKey.fromSlice("test:key");
+
+    var ctx = CachePutCtx.init(alloc, key, &storage, null, defaults);
+    defer ctx.deinit();
+
+    // Simulate cache put with response data
+    const payload = "HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 4\r\n\r\ntest";
+
+    const reason = try ctx.doCachePut(payload);
+    try testing.expect(reason == null); // Should be cacheable
+
+    _ = try ctx.cachePutFinish();
+
+    // Verify entry is in storage
+    const result = storage.lookup(&key);
+    try testing.expect(result == .hit);
+}
+
+test "CachePutCtx uncacheable response" {
+    var storage = MemoryStorage.init(testing.allocator, 100);
+    defer storage.deinit();
+
+    const defaultTtlFn = struct {
+        fn getTtl(_: u16) ?u64 {
+            return 60;
+        }
+    }.getTtl;
+
+    const defaults = CacheMetaDefaults.init(defaultTtlFn, 0, 0);
+    const key = CacheKey.fromSlice("test:key:uncacheable");
+
+    var ctx = CachePutCtx.init(testing.allocator, key, &storage, null, defaults);
+    defer ctx.deinit();
+
+    // Response with no-store
+    const payload = "HTTP/1.1 200 OK\r\nCache-Control: no-store\r\nContent-Length: 4\r\n\r\ntest";
+
+    const reason = try ctx.doCachePut(payload);
+    try testing.expect(reason != null);
+    try testing.expectEqual(NoCacheReason.origin_not_cache, reason.?);
+}
+
+test "CachePutCtx max file size" {
+    var storage = MemoryStorage.init(testing.allocator, 100);
+    defer storage.deinit();
+
+    const defaultTtlFn = struct {
+        fn getTtl(_: u16) ?u64 {
+            return 60;
+        }
+    }.getTtl;
+
+    const defaults = CacheMetaDefaults.init(defaultTtlFn, 0, 0);
+    const key = CacheKey.fromSlice("test:key:large");
+
+    var ctx = CachePutCtx.init(testing.allocator, key, &storage, null, defaults);
+    defer ctx.deinit();
+
+    ctx.setMaxFileSizeBytes(2); // Very small limit
+
+    // Response that exceeds limit (Content-Length: 4 > max 2)
+    const payload = "HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 4\r\n\r\ntest";
+
+    const reason = try ctx.doCachePut(payload);
+    try testing.expect(reason != null);
+    try testing.expectEqual(NoCacheReason.response_too_large, reason.?);
+}

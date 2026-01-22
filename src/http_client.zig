@@ -441,8 +441,8 @@ pub const HttpClient = struct {
         var uri = try http.Uri.parse(self.allocator, url);
         defer uri.deinit();
 
-        const host = uri.authority orelse return HttpClientError.InvalidResponse;
-        const port: u16 = 80; // TODO: Parse port from URI
+        const host = uri.host() orelse return HttpClientError.InvalidResponse;
+        const port: u16 = uri.port();
 
         // Build request
         var req = try http.RequestHeader.build(self.allocator, method, uri.pathAndQuery(), .http_1_1);

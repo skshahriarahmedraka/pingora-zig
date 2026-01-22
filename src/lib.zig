@@ -210,6 +210,8 @@ pub const tracing = @import("tracing.zig");
 
 // Server Framework
 pub const server = @import("server.zig");
+pub const background = @import("background.zig");
+pub const read_through = @import("read_through.zig");
 
 // HTTP/2 support
 pub const http2 = @import("http2.zig");

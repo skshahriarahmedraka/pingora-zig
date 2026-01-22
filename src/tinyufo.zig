@@ -157,40 +157,104 @@ const CountMinSketch = struct {
     }
 };
 
-/// FIFO Queue using ArrayList
-fn FifoQueue(comptime T: type) type {
-    _ = T;
+/// High-performance FIFO Queue using Ring Buffer
+/// O(1) push and pop operations instead of O(n) with ArrayList
+fn RingBuffer(comptime T: type) type {
     return struct {
         allocator: Allocator,
-        items: std.ArrayListUnmanaged(Key),
+        buffer: []T,
+        head: usize, // Index of first element (for pop)
+        tail: usize, // Index of next write position (for push)
+        count: usize, // Number of elements
         mutex: Mutex,
 
-        fn init(allocator: Allocator) @This() {
+        const Self = @This();
+        const INITIAL_CAPACITY: usize = 64;
+
+        fn init(allocator: Allocator) Self {
             return .{
                 .allocator = allocator,
-                .items = .{},
+                .buffer = &[_]T{},
+                .head = 0,
+                .tail = 0,
+                .count = 0,
                 .mutex = .{},
             };
         }
 
-        fn deinit(self: *@This()) void {
-            self.items.deinit(self.allocator);
+        fn deinit(self: *Self) void {
+            if (self.buffer.len > 0) {
+                self.allocator.free(self.buffer);
+            }
         }
 
-        fn push(self: *@This(), key: Key) void {
+        fn push(self: *Self, item: T) void {
             self.mutex.lock();
             defer self.mutex.unlock();
-            self.items.append(self.allocator, key) catch {};
+
+            // Ensure capacity
+            if (self.count >= self.buffer.len) {
+                self.grow() catch return;
+            }
+
+            self.buffer[self.tail] = item;
+            self.tail = (self.tail + 1) % self.buffer.len;
+            self.count += 1;
         }
 
-        fn pop(self: *@This()) ?Key {
+        fn pop(self: *Self) ?T {
             self.mutex.lock();
             defer self.mutex.unlock();
-            if (self.items.items.len == 0) return null;
-            const key = self.items.orderedRemove(0);
-            return key;
+
+            if (self.count == 0) return null;
+
+            const item = self.buffer[self.head];
+            self.head = (self.head + 1) % self.buffer.len;
+            self.count -= 1;
+            return item;
+        }
+
+        fn grow(self: *Self) !void {
+            const new_capacity = if (self.buffer.len == 0)
+                INITIAL_CAPACITY
+            else
+                self.buffer.len * 2;
+
+            const new_buffer = try self.allocator.alloc(T, new_capacity);
+
+            // Copy existing elements in order
+            if (self.count > 0) {
+                if (self.head < self.tail) {
+                    // Elements are contiguous
+                    @memcpy(new_buffer[0..self.count], self.buffer[self.head..self.tail]);
+                } else {
+                    // Elements wrap around
+                    const first_part = self.buffer.len - self.head;
+                    @memcpy(new_buffer[0..first_part], self.buffer[self.head..]);
+                    @memcpy(new_buffer[first_part..self.count], self.buffer[0..self.tail]);
+                }
+            }
+
+            if (self.buffer.len > 0) {
+                self.allocator.free(self.buffer);
+            }
+
+            self.buffer = new_buffer;
+            self.head = 0;
+            self.tail = self.count;
+        }
+
+        /// Get current length (for testing)
+        fn len(self: *const Self) usize {
+            return self.count;
         }
     };
+}
+
+/// FIFO Queue using Ring Buffer (high-performance replacement for ArrayList-based queue)
+fn FifoQueue(comptime T: type) type {
+    _ = T;
+    return RingBuffer(Key);
 }
 
 /// TinyUFO cache implementation
@@ -747,4 +811,94 @@ test "CountMinSketch different keys" {
     try testing.expectEqual(cms.get(2), 1);
     try testing.expectEqual(cms.get(3), 1);
     try testing.expectEqual(cms.get(4), 0); // Never incremented
+}
+
+// ============================================================================
+// RingBuffer Tests - High-performance FIFO queue
+// ============================================================================
+
+test "RingBuffer basic push and pop" {
+    var rb = RingBuffer(u64).init(testing.allocator);
+    defer rb.deinit();
+
+    rb.push(1);
+    rb.push(2);
+    rb.push(3);
+
+    try testing.expectEqual(rb.len(), 3);
+    try testing.expectEqual(rb.pop(), 1);
+    try testing.expectEqual(rb.pop(), 2);
+    try testing.expectEqual(rb.pop(), 3);
+    try testing.expectEqual(rb.pop(), null);
+    try testing.expectEqual(rb.len(), 0);
+}
+
+test "RingBuffer wrap around" {
+    var rb = RingBuffer(u64).init(testing.allocator);
+    defer rb.deinit();
+
+    // Fill initial capacity and more to trigger wrap-around behavior
+    for (0..100) |i| {
+        rb.push(i);
+    }
+
+    // Pop half
+    for (0..50) |i| {
+        try testing.expectEqual(rb.pop(), i);
+    }
+
+    // Push more (these should wrap around)
+    for (100..150) |i| {
+        rb.push(i);
+    }
+
+    // Verify FIFO order maintained
+    for (50..150) |i| {
+        try testing.expectEqual(rb.pop(), i);
+    }
+
+    try testing.expectEqual(rb.pop(), null);
+}
+
+test "RingBuffer grow with wrap around" {
+    var rb = RingBuffer(u64).init(testing.allocator);
+    defer rb.deinit();
+
+    // Push and pop to create wrap-around state
+    for (0..64) |i| {
+        rb.push(i);
+    }
+    for (0..32) |_| {
+        _ = rb.pop();
+    }
+    // Now head is at 32, tail at 0, elements 32..63 remain
+
+    // Push more to trigger grow while in wrapped state
+    for (64..128) |i| {
+        rb.push(i);
+    }
+
+    // Verify all elements in order
+    for (32..128) |i| {
+        try testing.expectEqual(rb.pop(), i);
+    }
+}
+
+test "RingBuffer empty pop" {
+    var rb = RingBuffer(u64).init(testing.allocator);
+    defer rb.deinit();
+
+    try testing.expectEqual(rb.pop(), null);
+    try testing.expectEqual(rb.len(), 0);
+}
+
+test "RingBuffer single element" {
+    var rb = RingBuffer(u64).init(testing.allocator);
+    defer rb.deinit();
+
+    rb.push(42);
+    try testing.expectEqual(rb.len(), 1);
+    try testing.expectEqual(rb.pop(), 42);
+    try testing.expectEqual(rb.len(), 0);
+    try testing.expectEqual(rb.pop(), null);
 }

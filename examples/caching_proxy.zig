@@ -4,7 +4,7 @@
 //! responses in memory to reduce backend load.
 
 const std = @import("std");
-const pingora = @import("../src/lib.zig");
+const pingora = @import("pingora");
 
 const http_parser = pingora.http_parser;
 const lru = pingora.lru;
@@ -160,17 +160,19 @@ pub const CachingProxy = struct {
     fn isCacheable(self: *Self, response: []const u8) bool {
         _ = self;
         var headers_buf: [http_parser.MAX_HEADERS]http_parser.HeaderRef = undefined;
-        if (http_parser.parseResponseFull(response, &headers_buf)) |parsed| {
-            // Only cache 200 OK
-            if (parsed.status_code != 200) return false;
-            // Check Cache-Control
-            for (parsed.headers) |h| {
-                if (std.ascii.eqlIgnoreCase(h.name, "Cache-Control")) {
-                    if (std.mem.indexOf(u8, h.value, "no-store") != null) return false;
-                    if (std.mem.indexOf(u8, h.value, "private") != null) return false;
+        if (http_parser.parseResponseFull(response, &headers_buf)) |maybe_parsed| {
+            if (maybe_parsed) |parsed| {
+                // Only cache 200 OK
+                if (parsed.status_code != 200) return false;
+                // Check Cache-Control
+                for (parsed.headers) |h| {
+                    if (std.ascii.eqlIgnoreCase(h.name, "Cache-Control")) {
+                        if (std.mem.indexOf(u8, h.value, "no-store") != null) return false;
+                        if (std.mem.indexOf(u8, h.value, "private") != null) return false;
+                    }
                 }
+                return true;
             }
-            return true;
         } else |_| {}
         return false;
     }
@@ -187,20 +189,20 @@ pub const CachingProxy = struct {
 
         _ = stream.write(request) catch return error.UpstreamWriteFailed;
 
-        var response = std.ArrayList(u8).init(self.allocator);
-        errdefer response.deinit();
+        var response: std.ArrayListUnmanaged(u8) = .{};
+        errdefer response.deinit(self.allocator);
 
         var buf: [8192]u8 = undefined;
         while (true) {
             const n = stream.read(&buf) catch break;
             if (n == 0) break;
-            try response.appendSlice(buf[0..n]);
+            try response.appendSlice(self.allocator, buf[0..n]);
             if (std.mem.indexOf(u8, response.items, "\r\n\r\n") != null) {
                 if (response.items.len > 1000 or n < buf.len) break;
             }
         }
 
-        return response.toOwnedSlice();
+        return response.toOwnedSlice(self.allocator);
     }
 
     pub fn getStats(self: *Self) Stats {

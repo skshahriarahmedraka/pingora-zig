@@ -123,7 +123,7 @@ zig build bench
 
 ## License
 
-Apache-2.0 - See [LICENSE](LICENSE) for details.
+ - Server Side Public License, See [LICENSE](LICENSE) for details.
 
 ## Credits
 

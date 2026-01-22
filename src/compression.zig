@@ -766,10 +766,23 @@ pub const ZstdCompressor = struct {
     }
 };
 
+/// Brotli C library FFI bindings
+/// These are only used when brotli is enabled via build option: -Dbrotli=true
+const brotli_enc = @cImport({
+    @cInclude("brotli/encode.h");
+});
+
+const brotli_dec = @cImport({
+    @cInclude("brotli/decode.h");
+});
+
+/// Check if brotli C library is available at compile time
+/// When built with -Dbrotli=true, the library will be linked
+pub const brotli_available = @hasDecl(brotli_enc, "BrotliEncoderCompress");
+
 /// Brotli Compressor
-/// Note: Zig's standard library does not include brotli compression.
-/// This provides type definitions and a stub implementation.
-/// For production use, link to the brotli C library.
+/// Uses the brotli C library for actual compression when available.
+/// Falls back to stub (passthrough) when brotli is not linked.
 pub const BrotliCompressor = struct {
     allocator: Allocator,
     output: std.ArrayListUnmanaged(u8),
@@ -777,13 +790,13 @@ pub const BrotliCompressor = struct {
     total_out: usize,
     duration_ns: u64,
     level: CompressionLevel,
-    /// Brotli window size (log2), default 19 (512KB)
+    /// Brotli window size (log2), default 22 (4MB)
     lgwin: u8,
 
     const Self = @This();
 
     pub fn init(allocator: Allocator) Self {
-        return initWithOptions(allocator, .default, 19);
+        return initWithOptions(allocator, .default, 22);
     }
 
     pub fn initWithOptions(allocator: Allocator, level: CompressionLevel, lgwin: u8) Self {
@@ -802,23 +815,65 @@ pub const BrotliCompressor = struct {
         self.output.deinit(self.allocator);
     }
 
+    /// Map CompressionLevel to Brotli quality (0-11)
+    fn toBrotliQuality(level: CompressionLevel) c_int {
+        return switch (level) {
+            .none => 0,
+            .fast => 1,
+            .level_2 => 2,
+            .level_3 => 3,
+            .level_4 => 4,
+            .level_5 => 5,
+            .default => 6,
+            .level_7 => 7,
+            .level_8 => 8,
+            .best => 11, // Brotli max quality
+        };
+    }
+
     /// Compress input data using brotli format
-    /// Note: This is a stub - requires brotli C library for real compression.
-    /// Returns error to indicate real compression is not available.
     pub fn compress(self: *Self, input: []const u8, end: bool) CompressionError![]u8 {
         _ = end;
         const start = std.time.nanoTimestamp();
         self.total_in += input.len;
 
-        // Brotli compression requires the brotli C library
-        // For now, return an error to indicate this
-        // In production, use: @cImport({ @cInclude("brotli/encode.h"); });
-
         self.output.clearRetainingCapacity();
 
-        // Store uncompressed for testing purposes (not valid brotli format)
-        self.output.appendSlice(self.allocator, input) catch return CompressionError.OutOfMemory;
-        self.total_out += self.output.items.len;
+        if (comptime brotli_available) {
+            // Use actual brotli compression
+            // Calculate maximum compressed size
+            const max_compressed_size = brotli_enc.BrotliEncoderMaxCompressedSize(input.len);
+            if (max_compressed_size == 0) {
+                return CompressionError.InvalidInput;
+            }
+
+            // Ensure output buffer is large enough
+            self.output.ensureTotalCapacity(self.allocator, max_compressed_size) catch {
+                return CompressionError.OutOfMemory;
+            };
+
+            var encoded_size: usize = max_compressed_size;
+            const result = brotli_enc.BrotliEncoderCompress(
+                toBrotliQuality(self.level), // quality
+                @intCast(self.lgwin), // lgwin
+                brotli_enc.BROTLI_MODE_GENERIC, // mode
+                input.len, // input size
+                input.ptr, // input data
+                &encoded_size, // output size (in/out)
+                self.output.items.ptr, // output buffer
+            );
+
+            if (result == brotli_enc.BROTLI_FALSE) {
+                return CompressionError.CompressFailed;
+            }
+
+            self.output.items.len = encoded_size;
+            self.total_out += encoded_size;
+        } else {
+            // Fallback: passthrough (stub behavior when brotli not linked)
+            self.output.appendSlice(self.allocator, input) catch return CompressionError.OutOfMemory;
+            self.total_out += self.output.items.len;
+        }
 
         const elapsed = std.time.nanoTimestamp() - start;
         self.duration_ns += @intCast(@max(0, elapsed));
@@ -826,9 +881,14 @@ pub const BrotliCompressor = struct {
         return self.output.items;
     }
 
+    /// Check if real brotli compression is available
+    pub fn isAvailable() bool {
+        return brotli_available;
+    }
+
     pub fn stat(self: *const Self) EncoderStats {
         return .{
-            .name = "brotli",
+            .name = if (brotli_available) "brotli" else "brotli-stub",
             .total_in = self.total_in,
             .total_out = self.total_out,
             .duration_ns = self.duration_ns,
@@ -879,9 +939,8 @@ pub const BrotliCompressor = struct {
 };
 
 /// Brotli Decompressor
-/// Note: Zig's standard library does not include brotli decompression.
-/// This provides type definitions and a stub implementation.
-/// For production use, link to the brotli C library.
+/// Uses the brotli C library for actual decompression when available.
+/// Falls back to stub (passthrough) when brotli is not linked.
 pub const BrotliDecompressor = struct {
     allocator: Allocator,
     output: std.ArrayListUnmanaged(u8),
@@ -906,22 +965,51 @@ pub const BrotliDecompressor = struct {
     }
 
     /// Decompress brotli input data
-    /// Note: This is a stub - requires brotli C library for real decompression.
     pub fn decompress(self: *Self, input: []const u8, end: bool) CompressionError![]u8 {
         _ = end;
         const start = std.time.nanoTimestamp();
         self.total_in += input.len;
 
-        // Brotli decompression requires the brotli C library
-        // For now, return an error to indicate this
-        // In production, use: @cImport({ @cInclude("brotli/decode.h"); });
-
         self.output.clearRetainingCapacity();
 
-        // Cannot decompress without brotli library
-        // For stub testing, just copy input (not valid behavior)
-        self.output.appendSlice(self.allocator, input) catch return CompressionError.OutOfMemory;
-        self.total_out += self.output.items.len;
+        if (comptime brotli_available) {
+            // Use actual brotli decompression
+            // Start with estimated output size (typically 4x input for compressed data)
+            var estimated_size: usize = @max(input.len * 4, 1024);
+
+            while (true) {
+                self.output.ensureTotalCapacity(self.allocator, estimated_size) catch {
+                    return CompressionError.OutOfMemory;
+                };
+
+                var decoded_size: usize = estimated_size;
+                const result = brotli_dec.BrotliDecoderDecompress(
+                    input.len, // input size
+                    input.ptr, // input data
+                    &decoded_size, // output size (in/out)
+                    self.output.items.ptr, // output buffer
+                );
+
+                if (result == brotli_dec.BROTLI_DECODER_RESULT_SUCCESS) {
+                    self.output.items.len = decoded_size;
+                    self.total_out += decoded_size;
+                    break;
+                } else if (result == brotli_dec.BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT) {
+                    // Need larger buffer
+                    estimated_size *= 2;
+                    if (estimated_size > 256 * 1024 * 1024) { // 256MB limit
+                        return CompressionError.DecompressFailed;
+                    }
+                    continue;
+                } else {
+                    return CompressionError.DecompressFailed;
+                }
+            }
+        } else {
+            // Fallback: passthrough (stub behavior when brotli not linked)
+            self.output.appendSlice(self.allocator, input) catch return CompressionError.OutOfMemory;
+            self.total_out += self.output.items.len;
+        }
 
         const elapsed = std.time.nanoTimestamp() - start;
         self.duration_ns += @intCast(@max(0, elapsed));
@@ -929,9 +1017,14 @@ pub const BrotliDecompressor = struct {
         return self.output.items;
     }
 
+    /// Check if real brotli decompression is available
+    pub fn isAvailable() bool {
+        return brotli_available;
+    }
+
     pub fn stat(self: *const Self) EncoderStats {
         return .{
-            .name = "de-brotli",
+            .name = if (brotli_available) "de-brotli" else "de-brotli-stub",
             .total_in = self.total_in,
             .total_out = self.total_out,
             .duration_ns = self.duration_ns,

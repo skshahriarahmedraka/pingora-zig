@@ -10,7 +10,7 @@
 //! - Connection tracking
 
 const std = @import("std");
-const pingora = @import("../src/lib.zig");
+const pingora = @import("pingora");
 
 const http_parser = pingora.http_parser;
 const ketama = pingora.ketama;
@@ -37,7 +37,7 @@ pub const Algorithm = enum {
 /// Load Balancer implementation
 pub const LoadBalancer = struct {
     allocator: std.mem.Allocator,
-    backends: std.ArrayList(Backend),
+    backends: std.ArrayListUnmanaged(Backend),
     algorithm: Algorithm,
     current_index: usize,
     weighted_index: usize,
@@ -48,7 +48,7 @@ pub const LoadBalancer = struct {
     pub fn init(allocator: std.mem.Allocator, algorithm: Algorithm) Self {
         return .{
             .allocator = allocator,
-            .backends = std.ArrayList(Backend).init(allocator),
+            .backends = .{},
             .algorithm = algorithm,
             .current_index = 0,
             .weighted_index = 0,
@@ -57,12 +57,12 @@ pub const LoadBalancer = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.backends.deinit();
+        self.backends.deinit(self.allocator);
     }
 
     /// Add a backend server
     pub fn addBackend(self: *Self, address: []const u8, port: u16, weight: u32) !void {
-        try self.backends.append(.{
+        try self.backends.append(self.allocator, .{
             .address = address,
             .port = port,
             .weight = weight,
@@ -185,6 +185,7 @@ pub const LoadBalancer = struct {
 
     /// Mark a backend as unhealthy
     pub fn markUnhealthy(self: *Self, backend: *Backend) void {
+        _ = self;
         backend.healthy = false;
         backend.failed_requests += 1;
     }
@@ -307,14 +308,14 @@ pub const LoadBalancingProxy = struct {
             return error.BackendWriteFailed;
         };
 
-        var response = std.ArrayList(u8).init(self.allocator);
-        errdefer response.deinit();
+        var response: std.ArrayListUnmanaged(u8) = .{};
+        errdefer response.deinit(self.allocator);
 
         var buf: [8192]u8 = undefined;
         while (true) {
             const n = stream.read(&buf) catch break;
             if (n == 0) break;
-            try response.appendSlice(buf[0..n]);
+            try response.appendSlice(self.allocator, buf[0..n]);
 
             // Simple check for complete response
             if (std.mem.indexOf(u8, response.items, "\r\n\r\n") != null) {
@@ -322,7 +323,7 @@ pub const LoadBalancingProxy = struct {
             }
         }
 
-        return response.toOwnedSlice();
+        return response.toOwnedSlice(self.allocator);
     }
 };
 
