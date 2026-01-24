@@ -42,7 +42,8 @@ const Point = struct {
 };
 
 /// CRC32 hash function (matching nginx behavior)
-fn crc32Hash(data: []const u8) u32 {
+/// Inlined for performance in hot paths
+inline fn crc32Hash(data: []const u8) u32 {
     return std.hash.crc.Crc32IsoHdlc.hash(data);
 }
 
@@ -140,30 +141,88 @@ pub const Continuum = struct {
         }
     }
 
+    /// Format address for hashing - optimized with direct byte manipulation
+    /// Format: "IP\0PORT" (nginx compatible)
     fn formatAddressForHash(buf: []u8, addr: net.Address) ![]u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const writer = fbs.writer();
+        var pos: usize = 0;
 
-        // Format: "IP\0PORT" (nginx compatible)
         switch (addr.any.family) {
             std.posix.AF.INET => {
                 const bytes = @as(*const [4]u8, @ptrCast(&addr.in.sa.addr));
-                try writer.print("{}.{}.{}.{}", .{ bytes[0], bytes[1], bytes[2], bytes[3] });
+                // Write each octet with dots - direct integer to ASCII
+                inline for (0..4) |i| {
+                    pos = writeU8(buf, pos, bytes[i]);
+                    if (i < 3) {
+                        buf[pos] = '.';
+                        pos += 1;
+                    }
+                }
             },
             std.posix.AF.INET6 => {
-                // IPv6 formatting
+                // IPv6 formatting - hex bytes
                 const ip6 = &addr.in6.sa.addr;
+                const hex_chars = "0123456789abcdef";
                 for (ip6) |byte| {
-                    try writer.print("{x:0>2}", .{byte});
+                    buf[pos] = hex_chars[byte >> 4];
+                    buf[pos + 1] = hex_chars[byte & 0x0f];
+                    pos += 2;
                 }
             },
             else => return error.UnsupportedAddressFamily,
         }
 
-        try writer.writeByte(0); // null separator
-        try writer.print("{}", .{addr.getPort()});
+        buf[pos] = 0; // null separator
+        pos += 1;
 
-        return fbs.getWritten();
+        // Write port - direct integer to ASCII
+        pos = writeU16(buf, pos, addr.getPort());
+
+        return buf[0..pos];
+    }
+
+    /// Fast u8 to decimal string (no allocation)
+    inline fn writeU8(buf: []u8, start: usize, val: u8) usize {
+        var pos = start;
+        if (val >= 100) {
+            buf[pos] = '0' + val / 100;
+            pos += 1;
+        }
+        if (val >= 10) {
+            buf[pos] = '0' + (val / 10) % 10;
+            pos += 1;
+        }
+        buf[pos] = '0' + val % 10;
+        return pos + 1;
+    }
+
+    /// Fast u16 to decimal string (no allocation)
+    inline fn writeU16(buf: []u8, start: usize, val: u16) usize {
+        var pos = start;
+        var v = val;
+        var digits: [5]u8 = undefined;
+        var digit_count: usize = 0;
+
+        // Extract digits in reverse order
+        if (v == 0) {
+            buf[pos] = '0';
+            return pos + 1;
+        }
+
+        while (v > 0) {
+            digits[digit_count] = @intCast(v % 10);
+            v /= 10;
+            digit_count += 1;
+        }
+
+        // Write digits in correct order
+        var i = digit_count;
+        while (i > 0) {
+            i -= 1;
+            buf[pos] = '0' + digits[i];
+            pos += 1;
+        }
+
+        return pos;
     }
 
     /// Find the node index for the given input

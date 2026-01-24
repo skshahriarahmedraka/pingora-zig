@@ -91,6 +91,7 @@ pub const integration_tests = @import("integration_tests.zig");
 // Level 2 modules (depend on Level 0-1)
 pub const header_serde = @import("header_serde.zig");
 pub const runtime = @import("runtime.zig");
+pub const async_io = @import("async_io.zig");
 pub const tls = @import("tls.zig");
 
 // Level 3 modules (Core networking)
@@ -109,6 +110,14 @@ pub const requestToWireFormat = header_serde.requestToWireFormat;
 pub const Runtime = runtime.Runtime;
 pub const TaskQueue = runtime.TaskQueue;
 pub const Task = runtime.Task;
+
+// Async I/O
+pub const EventLoop = async_io.EventLoop;
+pub const IoUring = async_io.IoUring;
+pub const Kqueue = async_io.Kqueue;
+pub const Epoll = async_io.Epoll;
+pub const CompletionToken = async_io.CompletionToken;
+pub const CompletionResult = async_io.CompletionResult;
 
 // TLS types
 pub const TlsVersion = tls.TlsVersion;

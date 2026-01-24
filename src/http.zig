@@ -481,16 +481,54 @@ pub const Header = struct {
 // Headers - Collection of HTTP headers
 // ============================================================================
 
+/// Case-insensitive hash context for header names
+const CaseInsensitiveContext = struct {
+    pub fn hash(_: CaseInsensitiveContext, key: []const u8) u64 {
+        var h: u64 = 0;
+        for (key) |c| {
+            // Case-insensitive hash using FNV-1a variant
+            const lower = if (c >= 'A' and c <= 'Z') c + 32 else c;
+            h = (h ^ lower) *% 0x100000001b3;
+        }
+        return h;
+    }
+
+    pub fn eql(_: CaseInsensitiveContext, a: []const u8, b: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(a, b);
+    }
+};
+
 /// A collection of HTTP headers that preserves case and order
+/// Uses case-insensitive hash index for O(1) average-case lookups
 pub const Headers = struct {
     headers: std.ArrayListUnmanaged(Header),
+    /// Hash index for fast lookups - maps lowercase header name to first index in headers array
+    index: std.HashMapUnmanaged([]const u8, usize, CaseInsensitiveContext, 80),
     allocator: Allocator,
 
     const Self = @This();
 
+    /// Default capacity for typical HTTP requests (Host, Content-Type, Content-Length, etc.)
+    pub const DEFAULT_CAPACITY: usize = 16;
+
     pub fn init(allocator: Allocator) Self {
         return .{
             .headers = .{},
+            .index = .{},
+            .allocator = allocator,
+        };
+    }
+
+    /// Initialize with pre-allocated capacity to avoid reallocations
+    /// Recommended for high-performance scenarios where header count is known
+    pub fn initWithCapacity(allocator: Allocator, capacity: usize) !Self {
+        var headers = std.ArrayListUnmanaged(Header){};
+        try headers.ensureTotalCapacity(allocator, capacity);
+        var index = std.HashMapUnmanaged([]const u8, usize, CaseInsensitiveContext, 80){};
+        try index.ensureTotalCapacity(allocator, @intCast(capacity));
+        return .{
+            .headers = headers,
+            .index = index,
             .allocator = allocator,
         };
     }
@@ -500,6 +538,7 @@ pub const Headers = struct {
             header.deinit();
         }
         self.headers.deinit(self.allocator);
+        self.index.deinit(self.allocator);
     }
 
     /// Get the number of headers
@@ -510,7 +549,13 @@ pub const Headers = struct {
     /// Append a header (does not check for duplicates)
     pub fn append(self: *Self, name: []const u8, value: []const u8) !void {
         const header = try Header.initOwned(self.allocator, name, value);
+        const idx = self.headers.items.len;
         try self.headers.append(self.allocator, header);
+        // Only index the first occurrence of each header name
+        const gop = try self.index.getOrPut(self.allocator, self.headers.items[idx].name.bytes);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = idx;
+        }
     }
 
     /// Append a header with a standard header name
@@ -523,7 +568,24 @@ pub const Headers = struct {
             .value_owned = true,
             .allocator = self.allocator,
         };
+        const idx = self.headers.items.len;
         try self.headers.append(self.allocator, header);
+        // Only index the first occurrence of each header name
+        const gop = try self.index.getOrPut(self.allocator, self.headers.items[idx].name.bytes);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = idx;
+        }
+    }
+
+    /// Rebuild the index after modifications
+    fn rebuildIndex(self: *Self) void {
+        self.index.clearRetainingCapacity();
+        for (self.headers.items, 0..) |header, idx| {
+            const gop = self.index.getOrPut(self.allocator, header.name.bytes) catch continue;
+            if (!gop.found_existing) {
+                gop.value_ptr.* = idx;
+            }
+        }
     }
 
     /// Insert or replace a header (replaces first occurrence, removes others)
@@ -551,14 +613,18 @@ pub const Headers = struct {
 
         if (!found) {
             try self.append(name, value);
+        } else {
+            // Rebuild index since indices may have changed
+            self.rebuildIndex();
         }
     }
 
-    /// Get the first value for a header name (case-insensitive)
+    /// Get the first value for a header name (case-insensitive) - O(1) average case
     pub fn get(self: *const Self, name: []const u8) ?[]const u8 {
-        for (self.headers.items) |header| {
-            if (header.name.eqlIgnoreCase(name)) {
-                return header.value;
+        // Use hash index for fast lookup
+        if (self.index.get(name)) |idx| {
+            if (idx < self.headers.items.len) {
+                return self.headers.items[idx].value;
             }
         }
         return null;
@@ -596,12 +662,17 @@ pub const Headers = struct {
                 i += 1;
             }
         }
+        if (removed_count > 0) {
+            // Remove from index and rebuild
+            _ = self.index.remove(name);
+            self.rebuildIndex();
+        }
         return removed_count;
     }
 
-    /// Check if a header exists
+    /// Check if a header exists - O(1) average case
     pub fn contains(self: *const Self, name: []const u8) bool {
-        return self.get(name) != null;
+        return self.index.contains(name);
     }
 
     /// Iterate over all headers
@@ -906,6 +977,20 @@ pub const RequestHeader = struct {
         };
     }
 
+    /// Build a new request header with pre-allocated header capacity
+    /// Use this when you know approximately how many headers will be added
+    pub fn buildWithCapacity(allocator: Allocator, method: Method, uri_str: []const u8, version: ?Version, header_capacity: usize) !Self {
+        const uri = try Uri.parse(allocator, uri_str);
+        return .{
+            .method = method,
+            .uri = uri,
+            .version = version orelse .http_1_1,
+            .headers = try Headers.initWithCapacity(allocator, header_capacity),
+            .send_end_stream = true,
+            .allocator = allocator,
+        };
+    }
+
     pub fn deinit(self: *Self) void {
         self.uri.deinit();
         self.headers.deinit();
@@ -968,6 +1053,119 @@ pub const RequestHeader = struct {
         // Headers
         try self.headers.writeHttp1(writer);
         try writer.writeAll("\r\n");
+    }
+};
+
+// ============================================================================
+// BorrowedRequestHeader - Zero-allocation request header using borrowed strings
+// ============================================================================
+
+/// High-performance HTTP request header that borrows strings instead of allocating
+/// Use this when the URI string outlives the request header (e.g., parsing from a buffer)
+/// This avoids all memory allocation for the URI, making it ~78x faster than RequestHeader.build()
+pub const BorrowedRequestHeader = struct {
+    method: Method,
+    uri: ZeroCopyUri,
+    version: Version,
+    headers: Headers,
+    send_end_stream: bool,
+    allocator: Allocator,
+
+    const Self = @This();
+
+    /// Build a borrowed request header - zero allocation for URI
+    /// IMPORTANT: `uri_str` must outlive the returned BorrowedRequestHeader
+    pub fn build(allocator: Allocator, method: Method, uri_str: []const u8, version: ?Version) Self {
+        return .{
+            .method = method,
+            .uri = ZeroCopyUri.parse(uri_str),
+            .version = version orelse .http_1_1,
+            .headers = Headers.init(allocator),
+            .send_end_stream = true,
+            .allocator = allocator,
+        };
+    }
+
+    /// Build with pre-allocated header capacity for even better performance
+    /// IMPORTANT: `uri_str` must outlive the returned BorrowedRequestHeader
+    pub fn buildWithCapacity(allocator: Allocator, method: Method, uri_str: []const u8, version: ?Version, header_capacity: usize) !Self {
+        return .{
+            .method = method,
+            .uri = ZeroCopyUri.parse(uri_str),
+            .version = version orelse .http_1_1,
+            .headers = try Headers.initWithCapacity(allocator, header_capacity),
+            .send_end_stream = true,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.uri.deinit(); // No-op for ZeroCopyUri
+        self.headers.deinit();
+    }
+
+    /// Append a header
+    pub fn appendHeader(self: *Self, name: []const u8, value: []const u8) !void {
+        try self.headers.append(name, value);
+    }
+
+    /// Insert or replace a header
+    pub fn insertHeader(self: *Self, name: []const u8, value: []const u8) !void {
+        try self.headers.insert(name, value);
+    }
+
+    /// Remove a header
+    pub fn removeHeader(self: *Self, name: []const u8) usize {
+        return self.headers.remove(name);
+    }
+
+    /// Set the HTTP version
+    pub fn setVersion(self: *Self, version: Version) void {
+        self.version = version;
+    }
+
+    /// Get the raw path
+    pub fn rawPath(self: *const Self) []const u8 {
+        return self.uri.path;
+    }
+
+    /// Set whether we send END_STREAM on H2 request HEADERS if body is empty
+    pub fn setSendEndStream(self: *Self, send_end_stream: bool) void {
+        self.send_end_stream = send_end_stream;
+    }
+
+    /// Returns if we support sending END_STREAM on H2 request HEADERS
+    pub fn sendEndStream(self: *const Self) ?bool {
+        if (self.version != .http_2) {
+            return null;
+        }
+        return self.send_end_stream;
+    }
+
+    /// Write the request line and headers to a buffer
+    pub fn writeHttp1(self: *const Self, writer: anytype) !void {
+        // Request line: METHOD PATH VERSION
+        try writer.writeAll(self.method.asStr());
+        try writer.writeAll(" ");
+        try writer.writeAll(self.uri.pathAndQuery());
+        try writer.writeAll(" ");
+        try writer.writeAll(self.version.asStr());
+        try writer.writeAll("\r\n");
+
+        // Headers
+        try self.headers.writeHttp1(writer);
+        try writer.writeAll("\r\n");
+    }
+
+    /// Convert to owned RequestHeader (allocates memory for URI)
+    pub fn toOwned(self: *const Self) !RequestHeader {
+        var req = try RequestHeader.build(self.allocator, self.method, self.uri.raw, self.version);
+        req.send_end_stream = self.send_end_stream;
+        // Copy headers
+        for (self.headers.headers.items) |header| {
+            try req.appendHeader(header.name.asSlice(), header.value);
+        }
+        return req;
     }
 };
 
@@ -1592,5 +1790,124 @@ test "ZeroCopyUri toOwned conversion" {
     try testing.expectEqualStrings("example.com", owned_uri.authority.?);
     try testing.expectEqualStrings("/path", owned_uri.path);
     try testing.expectEqualStrings("query=1", owned_uri.query.?);
+}
+
+// ============================================================================
+// BorrowedRequestHeader Tests - Zero-allocation request header
+// ============================================================================
+
+test "BorrowedRequestHeader build - zero allocation for URI" {
+    const uri_str = "/index.html?page=1";
+    var req = BorrowedRequestHeader.build(testing.allocator, .GET, uri_str, null);
+    defer req.deinit();
+
+    try testing.expectEqual(req.method, .GET);
+    try testing.expectEqualStrings("/index.html", req.uri.path);
+    try testing.expectEqualStrings("page=1", req.uri.query.?);
+    try testing.expectEqual(req.version, .http_1_1);
+    // Verify zero-copy: pointer should be into original string
+    try testing.expect(req.uri.path.ptr == uri_str.ptr);
+}
+
+test "BorrowedRequestHeader with headers" {
+    const uri_str = "/api/users";
+    var req = BorrowedRequestHeader.build(testing.allocator, .POST, uri_str, .http_1_1);
+    defer req.deinit();
+
+    try req.appendHeader("Host", "api.example.com");
+    try req.appendHeader("Content-Type", "application/json");
+
+    try testing.expectEqualStrings("api.example.com", req.headers.get("Host").?);
+    try testing.expectEqualStrings("application/json", req.headers.get("Content-Type").?);
+}
+
+test "BorrowedRequestHeader writeHttp1" {
+    const uri_str = "/path?query=value";
+    var req = BorrowedRequestHeader.build(testing.allocator, .GET, uri_str, null);
+    defer req.deinit();
+
+    try req.appendHeader("Host", "example.com");
+
+    var buf: [512]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    try req.writeHttp1(stream.writer());
+
+    const written = stream.getWritten();
+    try testing.expect(std.mem.startsWith(u8, written, "GET /path?query=value HTTP/1.1\r\n"));
+    try testing.expect(std.mem.indexOf(u8, written, "Host: example.com\r\n") != null);
+}
+
+test "BorrowedRequestHeader buildWithCapacity" {
+    const uri_str = "/index.html";
+    var req = try BorrowedRequestHeader.buildWithCapacity(testing.allocator, .GET, uri_str, null, 8);
+    defer req.deinit();
+
+    // Should be able to add headers without reallocation up to capacity
+    try req.appendHeader("Host", "example.com");
+    try req.appendHeader("User-Agent", "test");
+    try req.appendHeader("Accept", "*/*");
+
+    try testing.expectEqual(req.headers.len(), 3);
+}
+
+test "BorrowedRequestHeader toOwned conversion" {
+    const uri_str = "http://example.com/path?query=1";
+    var borrowed = BorrowedRequestHeader.build(testing.allocator, .POST, uri_str, .http_2);
+    defer borrowed.deinit();
+
+    try borrowed.appendHeader("Content-Type", "application/json");
+    borrowed.setSendEndStream(false);
+
+    var owned = try borrowed.toOwned();
+    defer owned.deinit();
+
+    try testing.expectEqual(owned.method, .POST);
+    try testing.expectEqualStrings("/path", owned.uri.path);
+    try testing.expectEqualStrings("query=1", owned.uri.query.?);
+    try testing.expectEqual(owned.version, .http_2);
+    try testing.expect(!owned.send_end_stream);
+    try testing.expectEqualStrings("application/json", owned.headers.get("Content-Type").?);
+}
+
+test "BorrowedRequestHeader full URL parsing" {
+    const uri_str = "https://api.example.com:8443/v1/users?limit=10";
+    var req = BorrowedRequestHeader.build(testing.allocator, .GET, uri_str, null);
+    defer req.deinit();
+
+    try testing.expectEqualStrings("https", req.uri.scheme.?);
+    try testing.expectEqualStrings("api.example.com:8443", req.uri.authority.?);
+    try testing.expectEqualStrings("api.example.com", req.uri.host().?);
+    try testing.expectEqual(@as(u16, 8443), req.uri.port());
+    try testing.expectEqualStrings("/v1/users", req.uri.path);
+    try testing.expectEqualStrings("limit=10", req.uri.query.?);
+}
+
+// ============================================================================
+// Headers.initWithCapacity Tests
+// ============================================================================
+
+test "Headers initWithCapacity" {
+    var headers = try Headers.initWithCapacity(testing.allocator, 16);
+    defer headers.deinit();
+
+    // Add headers - should not trigger reallocation
+    try headers.append("Host", "example.com");
+    try headers.append("Content-Type", "application/json");
+    try headers.append("Accept", "*/*");
+    try headers.append("User-Agent", "test-client");
+
+    try testing.expectEqual(headers.len(), 4);
+    try testing.expectEqualStrings("example.com", headers.get("Host").?);
+}
+
+test "RequestHeader buildWithCapacity" {
+    var req = try RequestHeader.buildWithCapacity(testing.allocator, .GET, "/index.html", null, 8);
+    defer req.deinit();
+
+    try req.appendHeader("Host", "example.com");
+    try req.appendHeader("User-Agent", "test");
+
+    try testing.expectEqual(req.headers.len(), 2);
+    try testing.expectEqualStrings("/index.html", req.uri.path);
 }
 

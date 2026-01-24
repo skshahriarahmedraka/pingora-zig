@@ -430,7 +430,7 @@ fn benchmarkLoadBalancer(allocator: Allocator) !void {
 fn benchmarkHttpHeaders(allocator: Allocator) !void {
     if (!json_output) std.debug.print("\n=== HTTP Header Benchmarks ===\n", .{});
 
-    // Benchmark request header creation
+    // Benchmark request header creation (allocating version)
     {
         var timer = try Timer.start();
         for (0..10000) |_| {
@@ -439,6 +439,18 @@ fn benchmarkHttpHeaders(allocator: Allocator) !void {
         }
         const elapsed = timer.read();
         recordResult("http", "request_create", elapsed, 10000);
+    }
+
+    // Benchmark zero-copy request header creation (BorrowedRequestHeader)
+    {
+        const uri_str = "/api/v1/users";
+        var timer = try Timer.start();
+        for (0..BENCH_ITERATIONS) |_| {
+            var req = http.BorrowedRequestHeader.build(allocator, .GET, uri_str, null);
+            req.deinit();
+        }
+        const elapsed = timer.read();
+        recordResult("http", "request_create_zerocopy", elapsed, BENCH_ITERATIONS);
     }
 
     // Benchmark header append

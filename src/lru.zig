@@ -26,6 +26,57 @@ fn LruNode(comptime T: type) type {
     };
 }
 
+/// Slab Allocator for fixed-size LruNode objects
+/// Pre-allocates objects in chunks for O(1) allocation without syscalls
+fn NodeSlabAllocator(comptime T: type) type {
+    return struct {
+        allocator: Allocator,
+        free_list: std.ArrayListUnmanaged(*LruNode(T)),
+        slabs: std.ArrayListUnmanaged([]LruNode(T)),
+
+        const Self = @This();
+        const Node = LruNode(T);
+        const SLAB_SIZE: usize = 64;
+
+        fn init(allocator: Allocator) Self {
+            return .{
+                .allocator = allocator,
+                .free_list = .{},
+                .slabs = .{},
+            };
+        }
+
+        fn deinit(self: *Self) void {
+            for (self.slabs.items) |slab| {
+                self.allocator.free(slab);
+            }
+            self.slabs.deinit(self.allocator);
+            self.free_list.deinit(self.allocator);
+        }
+
+        fn alloc(self: *Self) !*Node {
+            if (self.free_list.pop()) |ptr| {
+                return ptr;
+            }
+            try self.growSlab();
+            return self.free_list.pop() orelse unreachable;
+        }
+
+        fn free(self: *Self, ptr: *Node) void {
+            self.free_list.append(self.allocator, ptr) catch {};
+        }
+
+        fn growSlab(self: *Self) !void {
+            const slab = try self.allocator.alloc(Node, SLAB_SIZE);
+            try self.slabs.append(self.allocator, slab);
+            try self.free_list.ensureUnusedCapacity(self.allocator, SLAB_SIZE);
+            for (slab) |*item| {
+                self.free_list.appendAssumeCapacity(item);
+            }
+        }
+    };
+}
+
 /// Single LRU unit (one shard)
 pub fn LruUnit(comptime T: type) type {
     return struct {
@@ -33,6 +84,7 @@ pub fn LruUnit(comptime T: type) type {
         lookup_table: std.AutoHashMapUnmanaged(u64, *LruNode(T)),
         order: LinkedList,
         used_weight: usize,
+        node_slab: NodeSlabAllocator(T),
 
         const Self = @This();
         const Node = LruNode(T);
@@ -43,6 +95,7 @@ pub fn LruUnit(comptime T: type) type {
                 .lookup_table = .{},
                 .order = LinkedList.init(allocator),
                 .used_weight = 0,
+                .node_slab = NodeSlabAllocator(T).init(allocator),
             };
         }
 
@@ -54,16 +107,15 @@ pub fn LruUnit(comptime T: type) type {
                 .lookup_table = lookup_table,
                 .order = try LinkedList.initCapacity(allocator, capacity),
                 .used_weight = 0,
+                .node_slab = NodeSlabAllocator(T).init(allocator),
             };
         }
 
         pub fn deinit(self: *Self) void {
-            var it = self.lookup_table.valueIterator();
-            while (it.next()) |node_ptr| {
-                self.allocator.destroy(node_ptr.*);
-            }
+            // No need to individually free nodes - slab allocator frees all
             self.lookup_table.deinit(self.allocator);
             self.order.deinit();
+            self.node_slab.deinit();
         }
 
         /// Peek data without changing order
@@ -95,7 +147,7 @@ pub fn LruUnit(comptime T: type) type {
 
             self.used_weight += weight;
             const list_index = try self.order.pushHead(key);
-            const node = try self.allocator.create(Node);
+            const node = try self.node_slab.alloc();
             node.* = .{ .data = data, .list_index = list_index, .weight = weight };
             try self.lookup_table.put(self.allocator, key, node);
             return 0;
@@ -141,7 +193,7 @@ pub fn LruUnit(comptime T: type) type {
                 self.used_weight -= node.weight;
                 const data = node.data;
                 const weight = node.weight;
-                self.allocator.destroy(node);
+                self.node_slab.free(node);
                 return .{ data, weight };
             }
             return null;
@@ -155,7 +207,7 @@ pub fn LruUnit(comptime T: type) type {
                 self.used_weight -= node.weight;
                 const data = node.data;
                 const weight = node.weight;
-                self.allocator.destroy(node);
+                self.node_slab.free(node);
                 return .{ data, weight };
             }
             return null;
@@ -166,7 +218,7 @@ pub fn LruUnit(comptime T: type) type {
             if (self.lookup_table.contains(key)) return false;
 
             const list_index = try self.order.pushTail(key);
-            const node = try self.allocator.create(Node);
+            const node = try self.node_slab.alloc();
             node.* = .{ .data = data, .list_index = list_index, .weight = weight };
             try self.lookup_table.put(self.allocator, key, node);
             self.used_weight += weight;

@@ -9,6 +9,7 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const Mutex = std.Thread.Mutex;
+const RwLock = std.Thread.RwLock;
 
 const SMALL: bool = false;
 const MAIN: bool = true;
@@ -93,16 +94,87 @@ fn Bucket(comptime T: type) type {
     };
 }
 
+/// Slab Allocator for fixed-size objects
+/// Pre-allocates objects in chunks for O(1) allocation without syscalls
+fn SlabAllocator(comptime T: type) type {
+    return struct {
+        allocator: Allocator,
+        free_list: std.ArrayListUnmanaged(*T),
+        slabs: std.ArrayListUnmanaged([]T),
+        slab_size: usize,
+
+        const Self = @This();
+        const DEFAULT_SLAB_SIZE: usize = 64;
+
+        fn init(allocator: Allocator, slab_size: ?usize) Self {
+            return .{
+                .allocator = allocator,
+                .free_list = .{},
+                .slabs = .{},
+                .slab_size = slab_size orelse DEFAULT_SLAB_SIZE,
+            };
+        }
+
+        fn deinit(self: *Self) void {
+            // Free all slabs
+            for (self.slabs.items) |slab| {
+                self.allocator.free(slab);
+            }
+            self.slabs.deinit(self.allocator);
+            self.free_list.deinit(self.allocator);
+        }
+
+        fn alloc(self: *Self) !*T {
+            // Try to get from free list first
+            if (self.free_list.pop()) |ptr| {
+                return ptr;
+            }
+
+            // Allocate new slab
+            try self.growSlab();
+            return self.free_list.pop() orelse unreachable;
+        }
+
+        fn free(self: *Self, ptr: *T) void {
+            // Add back to free list
+            self.free_list.append(self.allocator, ptr) catch {
+                // If we can't add to free list, just leak it
+                // This should be rare
+            };
+        }
+
+        fn growSlab(self: *Self) !void {
+            const slab = try self.allocator.alloc(T, self.slab_size);
+            try self.slabs.append(self.allocator, slab);
+
+            // Add all items in slab to free list
+            try self.free_list.ensureUnusedCapacity(self.allocator, self.slab_size);
+            for (slab) |*item| {
+                self.free_list.appendAssumeCapacity(item);
+            }
+        }
+    };
+}
+
 /// Count-Min Sketch for frequency estimation
+/// Optimized with single hash + mixing for better cache locality and fewer operations
 const CountMinSketch = struct {
     allocator: Allocator,
     counters: [][]u8,
     width: usize,
-    depth: usize,
-    seeds: [4]u64,
+    width_mask: usize, // For fast modulo when width is power of 2
 
     fn init(allocator: Allocator, estimated_size: usize) !CountMinSketch {
-        const width = @max(estimated_size, 16);
+        // Round up to power of 2 for fast modulo
+        const width = blk: {
+            var w = @max(estimated_size, 16);
+            w |= w >> 1;
+            w |= w >> 2;
+            w |= w >> 4;
+            w |= w >> 8;
+            w |= w >> 16;
+            break :blk w + 1;
+        };
         const depth: usize = 4;
 
         var counters = try allocator.alloc([]u8, depth);
@@ -117,8 +189,7 @@ const CountMinSketch = struct {
             .allocator = allocator,
             .counters = counters,
             .width = width,
-            .depth = depth,
-            .seeds = .{ 0x12345678, 0x87654321, 0xDEADBEEF, 0xCAFEBABE },
+            .width_mask = width - 1,
         };
     }
 
@@ -129,16 +200,30 @@ const CountMinSketch = struct {
         self.allocator.free(self.counters);
     }
 
-    fn hash(self: *const CountMinSketch, key: Key, seed_idx: usize) usize {
-        var h = std.hash.Wyhash.init(self.seeds[seed_idx]);
-        h.update(std.mem.asBytes(&key));
-        return @intCast(h.final() % self.width);
+    /// Compute 4 hash indices from a single base hash using fast mixing
+    /// This is much faster than calling Wyhash 4 times
+    inline fn hashIndices(self: *const CountMinSketch, key: Key) [4]usize {
+        // Single high-quality hash
+        const h = std.hash.Wyhash.hash(0, std.mem.asBytes(&key));
+        
+        // Split into two 32-bit values and derive 4 indices using cheap mixing
+        const h1: u64 = h;
+        const h2: u64 = h >> 32;
+        
+        return .{
+            @intCast(h1 & self.width_mask),
+            @intCast(h2 & self.width_mask),
+            @intCast((h1 +% h2) & self.width_mask),
+            @intCast((h1 +% h2 *% 2) & self.width_mask),
+        };
     }
 
     fn increment(self: *CountMinSketch, key: Key) u8 {
+        const indices = self.hashIndices(key);
         var min_count: u8 = 255;
-        for (0..self.depth) |i| {
-            const idx = self.hash(key, i);
+        
+        inline for (0..4) |i| {
+            const idx = indices[i];
             if (self.counters[i][idx] < 255) {
                 self.counters[i][idx] += 1;
             }
@@ -148,10 +233,11 @@ const CountMinSketch = struct {
     }
 
     fn get(self: *const CountMinSketch, key: Key) u8 {
+        const indices = self.hashIndices(key);
         var min_count: u8 = 255;
-        for (0..self.depth) |i| {
-            const idx = self.hash(key, i);
-            min_count = @min(min_count, self.counters[i][idx]);
+        
+        inline for (0..4) |i| {
+            min_count = @min(min_count, self.counters[i][indices[i]]);
         }
         return min_count;
     }
@@ -258,11 +344,13 @@ fn FifoQueue(comptime T: type) type {
 }
 
 /// TinyUFO cache implementation
+/// Optimized with RwLock for concurrent read access
 pub fn TinyUfo(comptime K: type, comptime T: type) type {
     return struct {
         allocator: Allocator,
         buckets: std.AutoHashMapUnmanaged(Key, *Bucket(T)),
-        buckets_mutex: Mutex,
+        buckets_rwlock: RwLock, // RwLock allows concurrent reads
+        bucket_slab: SlabAllocator(Bucket(T)),
 
         small_queue: FifoQueue(T),
         small_weight: std.atomic.Value(usize),
@@ -279,7 +367,8 @@ pub fn TinyUfo(comptime K: type, comptime T: type) type {
             return .{
                 .allocator = allocator,
                 .buckets = .{},
-                .buckets_mutex = .{},
+                .buckets_rwlock = .{},
+                .bucket_slab = SlabAllocator(Bucket(T)).init(allocator, null),
                 .small_queue = FifoQueue(T).init(allocator),
                 .small_weight = std.atomic.Value(usize).init(0),
                 .main_queue = FifoQueue(T).init(allocator),
@@ -290,30 +379,31 @@ pub fn TinyUfo(comptime K: type, comptime T: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            var it = self.buckets.valueIterator();
-            while (it.next()) |bucket_ptr| {
-                self.allocator.destroy(bucket_ptr.*);
-            }
+            // No need to individually free buckets - slab allocator frees all
             self.buckets.deinit(self.allocator);
+            self.bucket_slab.deinit();
             self.small_queue.deinit();
             self.main_queue.deinit();
             self.estimator.deinit();
         }
 
-        fn hashKey(key: *const K) Key {
-            var hasher = std.hash.Wyhash.init(0);
-            hasher.update(std.mem.asBytes(key));
-            return hasher.final();
+        /// Compute hash key - inlined for performance
+        inline fn hashKey(key: *const K) Key {
+            // Use direct hash for better performance
+            return std.hash.Wyhash.hash(0, std.mem.asBytes(key));
         }
 
         /// Get a value from the cache
+        /// Uses read lock for concurrent access - multiple readers can access simultaneously
         pub fn get(self: *Self, key: *const K) ?T {
             const hashed = hashKey(key);
 
-            self.buckets_mutex.lock();
-            defer self.buckets_mutex.unlock();
+            // Use read lock - allows concurrent reads
+            self.buckets_rwlock.lockShared();
+            defer self.buckets_rwlock.unlockShared();
 
             if (self.buckets.get(hashed)) |bucket| {
+                // incUses is atomic, safe under read lock
                 _ = bucket.uses.incUses();
                 return bucket.data;
             }
@@ -336,8 +426,8 @@ pub fn TinyUfo(comptime K: type, comptime T: type) type {
         pub fn remove(self: *Self, key: *const K) ?T {
             const hashed = hashKey(key);
 
-            self.buckets_mutex.lock();
-            defer self.buckets_mutex.unlock();
+            self.buckets_rwlock.lock();
+            defer self.buckets_rwlock.unlock();
 
             if (self.buckets.fetchRemove(hashed)) |kv| {
                 const bucket = kv.value;
@@ -350,7 +440,7 @@ pub fn TinyUfo(comptime K: type, comptime T: type) type {
                     _ = self.small_weight.fetchSub(w, .seq_cst);
                 }
 
-                self.allocator.destroy(bucket);
+                self.bucket_slab.free(bucket);
                 return data;
             }
             return null;
@@ -360,7 +450,7 @@ pub fn TinyUfo(comptime K: type, comptime T: type) type {
             const new_freq = self.estimator.increment(key);
             std.debug.assert(weight > 0);
 
-            self.buckets_mutex.lock();
+            self.buckets_rwlock.lock();
 
             // Check if key already exists
             if (self.buckets.get(key)) |bucket| {
@@ -384,11 +474,11 @@ pub fn TinyUfo(comptime K: type, comptime T: type) type {
                     }
                     bucket.weight = weight;
                 }
-                self.buckets_mutex.unlock();
+                self.buckets_rwlock.unlock();
                 return self.evictToLimit(0);
             }
 
-            self.buckets_mutex.unlock();
+            self.buckets_rwlock.unlock();
 
             // Evict to make room
             var evicted = try self.evictToLimit(weight);
@@ -410,8 +500,8 @@ pub fn TinyUfo(comptime K: type, comptime T: type) type {
                 }
             }
 
-            // Create new bucket
-            const bucket = try self.allocator.create(Bucket(T));
+            // Create new bucket using slab allocator
+            const bucket = try self.bucket_slab.alloc();
             bucket.* = .{
                 .queue = Location.initSmall(),
                 .weight = final_weight,
@@ -419,15 +509,15 @@ pub fn TinyUfo(comptime K: type, comptime T: type) type {
                 .data = final_data,
             };
 
-            self.buckets_mutex.lock();
-            defer self.buckets_mutex.unlock();
+            self.buckets_rwlock.lock();
+            defer self.buckets_rwlock.unlock();
 
             if (self.buckets.get(final_key) == null) {
                 try self.buckets.put(self.allocator, final_key, bucket);
                 self.small_queue.push(final_key);
                 _ = self.small_weight.fetchAdd(final_weight, .seq_cst);
             } else {
-                self.allocator.destroy(bucket);
+                self.bucket_slab.free(bucket);
             }
 
             return evicted;
@@ -466,8 +556,8 @@ pub fn TinyUfo(comptime K: type, comptime T: type) type {
             while (true) {
                 const to_evict = self.small_queue.pop() orelse return null;
 
-                self.buckets_mutex.lock();
-                defer self.buckets_mutex.unlock();
+                self.buckets_rwlock.lock();
+                defer self.buckets_rwlock.unlock();
 
                 if (self.buckets.get(to_evict)) |bucket| {
                     const w = bucket.weight;
@@ -482,7 +572,7 @@ pub fn TinyUfo(comptime K: type, comptime T: type) type {
                         // Evict
                         const data = bucket.data;
                         _ = self.buckets.remove(to_evict);
-                        self.allocator.destroy(bucket);
+                        self.bucket_slab.free(bucket);
                         return .{ .key = to_evict, .data = data, .weight = w };
                     }
                 }
@@ -493,8 +583,8 @@ pub fn TinyUfo(comptime K: type, comptime T: type) type {
             while (true) {
                 const to_evict = self.main_queue.pop() orelse return null;
 
-                self.buckets_mutex.lock();
-                defer self.buckets_mutex.unlock();
+                self.buckets_rwlock.lock();
+                defer self.buckets_rwlock.unlock();
 
                 if (self.buckets.get(to_evict)) |bucket| {
                     if (bucket.uses.decrUses() > 0) {
@@ -506,7 +596,7 @@ pub fn TinyUfo(comptime K: type, comptime T: type) type {
                         _ = self.main_weight.fetchSub(w, .seq_cst);
                         const data = bucket.data;
                         _ = self.buckets.remove(to_evict);
-                        self.allocator.destroy(bucket);
+                        self.bucket_slab.free(bucket);
                         return .{ .key = to_evict, .data = data, .weight = w };
                     }
                 }
@@ -514,10 +604,11 @@ pub fn TinyUfo(comptime K: type, comptime T: type) type {
         }
 
         /// Check which queue a key is in (for testing)
+        /// Uses read lock since it only reads data
         pub fn peekQueue(self: *Self, key: K) ?bool {
             const hashed = hashKey(&key);
-            self.buckets_mutex.lock();
-            defer self.buckets_mutex.unlock();
+            self.buckets_rwlock.lockShared();
+            defer self.buckets_rwlock.unlockShared();
 
             if (self.buckets.get(hashed)) |bucket| {
                 return bucket.queue.isMain();

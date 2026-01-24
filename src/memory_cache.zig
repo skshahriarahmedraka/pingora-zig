@@ -119,11 +119,16 @@ pub fn MemoryCache(comptime K: type, comptime V: type) type {
             self.store.deinit();
         }
 
-        /// Hash a key to u64
-        fn hashKey(key: K) u64 {
-            var hasher = std.hash.Wyhash.init(0);
-            std.hash.autoHash(&hasher, key);
-            return hasher.final();
+        /// Hash a key to u64 - inlined for performance
+        inline fn hashKey(key: K) u64 {
+            // Use direct hash for primitive types, autoHash for complex types
+            if (@sizeOf(K) <= 8 and @typeInfo(K) != .pointer) {
+                return std.hash.Wyhash.hash(0, std.mem.asBytes(&key));
+            } else {
+                var hasher = std.hash.Wyhash.init(0);
+                std.hash.autoHash(&hasher, key);
+                return hasher.final();
+            }
         }
 
         /// Fetch a key and return its value along with a CacheStatus.
