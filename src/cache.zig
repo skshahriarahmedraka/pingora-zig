@@ -20,6 +20,221 @@ const memory_cache = @import("memory_cache.zig");
 const lru = @import("lru.zig");
 
 // ============================================================================
+// LruTracker - O(1) LRU order tracking with HashMap + doubly-linked list
+// ============================================================================
+
+/// A generic LRU tracker that provides O(1) operations for:
+/// - add: Add a key to the end (most recent)
+/// - access: Move a key to the end (most recent)  
+/// - remove: Remove a key from anywhere
+/// - popOldest: Get and remove the oldest key
+///
+/// Uses a HashMap for O(1) key lookup combined with a doubly-linked list
+/// for O(1) reordering.
+pub fn LruTracker(comptime K: type) type {
+    return struct {
+        /// Node in the doubly-linked list
+        const Node = struct {
+            key: K,
+            prev: ?*Node,
+            next: ?*Node,
+        };
+
+        /// Map from key to node for O(1) lookup
+        map: std.AutoHashMap(K, *Node),
+        /// Head of list (oldest)
+        head: ?*Node,
+        /// Tail of list (most recent)
+        tail: ?*Node,
+        /// Allocator for nodes
+        allocator: Allocator,
+        /// Count of entries
+        len: usize,
+
+        const Self = @This();
+
+        pub fn init(allocator: Allocator) Self {
+            return .{
+                .map = std.AutoHashMap(K, *Node).init(allocator),
+                .head = null,
+                .tail = null,
+                .allocator = allocator,
+                .len = 0,
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            // Free all nodes
+            var current = self.head;
+            while (current) |node| {
+                const next = node.next;
+                self.allocator.destroy(node);
+                current = next;
+            }
+            self.map.deinit();
+        }
+
+        /// Add a new key to the end (most recent position) - O(1)
+        pub fn add(self: *Self, key: K) !void {
+            // If key already exists, just move it to end
+            if (self.map.get(key)) |_| {
+                self.access(key);
+                return;
+            }
+
+            const node = try self.allocator.create(Node);
+            node.* = .{
+                .key = key,
+                .prev = self.tail,
+                .next = null,
+            };
+
+            // Link to tail
+            if (self.tail) |t| {
+                t.next = node;
+            } else {
+                self.head = node;
+            }
+            self.tail = node;
+
+            try self.map.put(key, node);
+            self.len += 1;
+        }
+
+        /// Move a key to the end (most recent position) - O(1)
+        pub fn access(self: *Self, key: K) void {
+            const node = self.map.get(key) orelse return;
+
+            // Already at tail, nothing to do
+            if (node == self.tail) return;
+
+            // Unlink from current position
+            if (node.prev) |p| {
+                p.next = node.next;
+            } else {
+                self.head = node.next;
+            }
+            if (node.next) |n| {
+                n.prev = node.prev;
+            }
+
+            // Link to tail
+            node.prev = self.tail;
+            node.next = null;
+            if (self.tail) |t| {
+                t.next = node;
+            }
+            self.tail = node;
+        }
+
+        /// Remove a key from the tracker - O(1)
+        pub fn remove(self: *Self, key: K) void {
+            const node = self.map.fetchRemove(key) orelse return;
+            const n = node.value;
+
+            // Unlink
+            if (n.prev) |p| {
+                p.next = n.next;
+            } else {
+                self.head = n.next;
+            }
+            if (n.next) |next| {
+                next.prev = n.prev;
+            } else {
+                self.tail = n.prev;
+            }
+
+            self.allocator.destroy(n);
+            self.len -= 1;
+        }
+
+        /// Get the oldest key without removing it - O(1)
+        pub fn peekOldest(self: *const Self) ?K {
+            return if (self.head) |h| h.key else null;
+        }
+
+        /// Remove and return the oldest key - O(1)
+        pub fn popOldest(self: *Self) ?K {
+            const h = self.head orelse return null;
+            const key = h.key;
+
+            // Update head
+            self.head = h.next;
+            if (self.head) |new_head| {
+                new_head.prev = null;
+            } else {
+                self.tail = null;
+            }
+
+            _ = self.map.remove(key);
+            self.allocator.destroy(h);
+            self.len -= 1;
+
+            return key;
+        }
+
+        /// Check if a key exists - O(1)
+        pub fn contains(self: *const Self) bool {
+            return self.map.contains();
+        }
+
+        /// Get number of entries
+        pub fn count(self: *const Self) usize {
+            return self.len;
+        }
+
+        /// Iterate from oldest to newest
+        pub fn iterateOldestFirst(self: *const Self) Iterator {
+            return .{ .current = self.head };
+        }
+
+        pub const Iterator = struct {
+            current: ?*Node,
+
+            pub fn next(self: *Iterator) ?K {
+                const node = self.current orelse return null;
+                self.current = node.next;
+                return node.key;
+            }
+        };
+
+        /// Clear all entries
+        pub fn clear(self: *Self) void {
+            var current = self.head;
+            while (current) |node| {
+                const n = node.next;
+                self.allocator.destroy(node);
+                current = n;
+            }
+            self.map.clearRetainingCapacity();
+            self.head = null;
+            self.tail = null;
+            self.len = 0;
+        }
+
+        /// Convert to array (for serialization) - allocates
+        pub fn toArray(self: *const Self, allocator: Allocator) ![]K {
+            const arr = try allocator.alloc(K, self.len);
+            var i: usize = 0;
+            var it = self.iterateOldestFirst();
+            while (it.next()) |key| {
+                arr[i] = key;
+                i += 1;
+            }
+            return arr;
+        }
+
+        /// Load from array (for deserialization)
+        pub fn loadFromArray(self: *Self, keys: []const K) !void {
+            self.clear();
+            for (keys) |key| {
+                try self.add(key);
+            }
+        }
+    };
+}
+
+// ============================================================================
 // Cache-Control Directives
 // ============================================================================
 
@@ -1597,11 +1812,13 @@ pub const CustomReasonPredicate = *const fn ([]const u8) bool;
 /// add checks in request_cache_filter to avoid enabling cache in the first place.
 /// The predictor's bypass mechanism handles cases where the request _looks_ cacheable
 /// but its previous responses suggest otherwise.
+/// Cacheability Predictor
+///
+/// Remembers previously uncacheable assets using O(1) LRU tracking.
+/// Allows bypassing cache / cache lock early based on historical precedent.
 pub const CachePredictor = struct {
-    /// LRU cache of uncacheable key hashes (using hash map + linked list for LRU behavior)
-    uncacheable_keys: std.AutoHashMap(u128, void),
-    /// Order of keys for LRU eviction (oldest first)
-    key_order: std.ArrayListUnmanaged(u128),
+    /// LRU tracker for uncacheable key hashes - O(1) operations
+    key_order: LruTracker(u128),
     /// Maximum capacity
     capacity: usize,
     /// Optional predicate to skip certain custom reasons
@@ -1624,8 +1841,7 @@ pub const CachePredictor = struct {
         skip_custom_reasons_fn: ?CustomReasonPredicate,
     ) !Self {
         return .{
-            .uncacheable_keys = std.AutoHashMap(u128, void).init(allocator),
-            .key_order = .{},
+            .key_order = LruTracker(u128).init(allocator),
             .capacity = capacity,
             .skip_custom_reasons_fn = skip_custom_reasons_fn,
             .mutex = .{},
@@ -1634,8 +1850,7 @@ pub const CachePredictor = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.uncacheable_keys.deinit();
-        self.key_order.deinit(self.allocator);
+        self.key_order.deinit();
     }
 
     /// Return true if likely cacheable, false if likely not.
@@ -1647,7 +1862,7 @@ pub const CachePredictor = struct {
         defer self.mutex.unlock();
 
         // If key is in uncacheable list, predict not cacheable
-        return !self.uncacheable_keys.contains(hash);
+        return self.key_order.map.get(hash) == null;
     }
 
     /// Mark a key as cacheable (remove from uncacheable list).
@@ -1659,20 +1874,13 @@ pub const CachePredictor = struct {
         defer self.mutex.unlock();
 
         // Check if in uncacheable list
-        if (!self.uncacheable_keys.contains(hash)) {
+        if (self.key_order.map.get(hash) == null) {
             // Not in uncacheable list, nothing to do
             return true;
         }
 
-        // Remove from uncacheable list
-        _ = self.uncacheable_keys.remove(hash);
-        // Remove from order list
-        for (self.key_order.items, 0..) |k, i| {
-            if (k == hash) {
-                _ = self.key_order.orderedRemove(i);
-                break;
-            }
-        }
+        // Remove from uncacheable list - O(1)
+        self.key_order.remove(hash);
         return false;
     }
 
@@ -1702,32 +1910,19 @@ pub const CachePredictor = struct {
         defer self.mutex.unlock();
 
         // Check if already in uncacheable list
-        if (self.uncacheable_keys.contains(hash)) {
-            // Already marked uncacheable, but update LRU position (move to end)
-            for (self.key_order.items, 0..) |k, i| {
-                if (k == hash) {
-                    _ = self.key_order.orderedRemove(i);
-                    break;
-                }
-            }
-            self.key_order.append(self.allocator, hash) catch return false;
+        if (self.key_order.map.get(hash) != null) {
+            // Already marked uncacheable, but update LRU position (move to end) - O(1)
+            self.key_order.access(hash);
             return false;
         }
 
-        // Evict oldest if at capacity
-        if (self.key_order.items.len >= self.capacity) {
-            if (self.key_order.items.len > 0) {
-                const oldest = self.key_order.orderedRemove(0);
-                _ = self.uncacheable_keys.remove(oldest);
-            }
+        // Evict oldest if at capacity - O(1)
+        if (self.key_order.count() >= self.capacity) {
+            _ = self.key_order.popOldest();
         }
 
-        // Add to uncacheable list
-        self.uncacheable_keys.put(hash, {}) catch return null;
-        self.key_order.append(self.allocator, hash) catch {
-            _ = self.uncacheable_keys.remove(hash);
-            return null;
-        };
+        // Add to uncacheable list - O(1)
+        self.key_order.add(hash) catch return null;
         return true;
     }
 
@@ -2674,9 +2869,10 @@ pub const CustomEviction = struct {
 /// LRU Eviction Manager
 ///
 /// Evicts the least recently used entries first.
+/// Uses LruTracker for O(1) access/remove operations instead of O(n) array operations.
 pub const LruEviction = struct {
-    /// Access order (most recent at end)
-    access_order: std.ArrayListUnmanaged(u128),
+    /// Access order tracker (O(1) operations)
+    access_order: LruTracker(u128),
     /// Entry sizes
     sizes: std.AutoHashMap(u128, usize),
     /// Selection buffer for results
@@ -2688,7 +2884,7 @@ pub const LruEviction = struct {
 
     pub fn init(allocator: Allocator) Self {
         return .{
-            .access_order = .{},
+            .access_order = LruTracker(u128).init(allocator),
             .sizes = std.AutoHashMap(u128, usize).init(allocator),
             .selection_buffer = .{},
             .allocator = allocator,
@@ -2696,7 +2892,7 @@ pub const LruEviction = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.access_order.deinit(self.allocator);
+        self.access_order.deinit();
         self.sizes.deinit();
         self.selection_buffer.deinit(self.allocator);
     }
@@ -2711,8 +2907,9 @@ pub const LruEviction = struct {
         self.selection_buffer.clearRetainingCapacity();
         var bytes_freed: usize = 0;
 
-        // Evict from oldest to newest
-        for (self.access_order.items) |key_hash| {
+        // Evict from oldest to newest using iterator
+        var it = self.access_order.iterateOldestFirst();
+        while (it.next()) |key_hash| {
             if (bytes_freed >= bytes_needed) break;
 
             if (self.sizes.get(key_hash)) |size| {
@@ -2724,35 +2921,25 @@ pub const LruEviction = struct {
         return self.selection_buffer.items;
     }
 
+    /// Record access - O(1) instead of O(n)
     pub fn recordAccess(self: *Self, key_hash: u128) void {
-        // Move to end of access order
-        for (self.access_order.items, 0..) |k, i| {
-            if (k == key_hash) {
-                _ = self.access_order.orderedRemove(i);
-                break;
-            }
-        }
-        self.access_order.append(self.allocator, key_hash) catch return;
+        self.access_order.access(key_hash);
     }
 
     pub fn recordAdd(self: *Self, key_hash: u128, size: usize) void {
         self.sizes.put(key_hash, size) catch return;
-        self.access_order.append(self.allocator, key_hash) catch return;
+        self.access_order.add(key_hash) catch return;
     }
 
+    /// Record removal - O(1) instead of O(n)
     pub fn recordRemove(self: *Self, key_hash: u128) void {
         _ = self.sizes.remove(key_hash);
-        for (self.access_order.items, 0..) |k, i| {
-            if (k == key_hash) {
-                _ = self.access_order.orderedRemove(i);
-                break;
-            }
-        }
+        self.access_order.remove(key_hash);
     }
 
     pub fn save(self: *Self, allocator: Allocator) ![]u8 {
         // Simple format: count followed by key hashes
-        const count = self.access_order.items.len;
+        const count = self.access_order.count();
         const size = @sizeOf(usize) + count * @sizeOf(u128);
         const data = try allocator.alloc(u8, size);
 
@@ -2760,7 +2947,8 @@ pub const LruEviction = struct {
         @memcpy(data[offset..][0..@sizeOf(usize)], std.mem.asBytes(&count));
         offset += @sizeOf(usize);
 
-        for (self.access_order.items) |key_hash| {
+        var it = self.access_order.iterateOldestFirst();
+        while (it.next()) |key_hash| {
             @memcpy(data[offset..][0..@sizeOf(u128)], std.mem.asBytes(&key_hash));
             offset += @sizeOf(u128);
         }
@@ -2774,12 +2962,12 @@ pub const LruEviction = struct {
         const count = std.mem.bytesToValue(usize, data[0..@sizeOf(usize)]);
         var offset: usize = @sizeOf(usize);
 
-        self.access_order.clearRetainingCapacity();
+        self.access_order.clear();
 
         for (0..count) |_| {
             if (offset + @sizeOf(u128) > data.len) break;
             const key_hash = std.mem.bytesToValue(u128, data[offset..][0..@sizeOf(u128)]);
-            try self.access_order.append(self.allocator, key_hash);
+            try self.access_order.add(key_hash);
             offset += @sizeOf(u128);
         }
     }
@@ -2926,9 +3114,10 @@ pub const SizeAwareLruEviction = struct {
 ///
 /// A lightweight LRU implementation that only tracks access order.
 /// Does not track sizes - useful when entries are roughly the same size.
+/// Uses LruTracker for O(1) access/remove operations instead of O(n) array operations.
 pub const SimpleLruEviction = struct {
-    /// Access order (most recent at end)
-    access_order: std.ArrayListUnmanaged(u128),
+    /// Access order tracker (O(1) operations)
+    access_order: LruTracker(u128),
     /// Selection buffer
     selection_buffer: std.ArrayListUnmanaged(u128),
     /// Default entry size estimate
@@ -2940,7 +3129,7 @@ pub const SimpleLruEviction = struct {
 
     pub fn init(allocator: Allocator, default_size: usize) Self {
         return .{
-            .access_order = .{},
+            .access_order = LruTracker(u128).init(allocator),
             .selection_buffer = .{},
             .default_size = default_size,
             .allocator = allocator,
@@ -2948,7 +3137,7 @@ pub const SimpleLruEviction = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.access_order.deinit(self.allocator);
+        self.access_order.deinit();
         self.selection_buffer.deinit(self.allocator);
     }
 
@@ -2965,7 +3154,8 @@ pub const SimpleLruEviction = struct {
         // Calculate how many entries to evict
         const entries_needed = (bytes_needed + self.default_size - 1) / self.default_size;
 
-        for (self.access_order.items) |key_hash| {
+        var it = self.access_order.iterateOldestFirst();
+        while (it.next()) |key_hash| {
             if (self.selection_buffer.items.len >= entries_needed and bytes_freed >= bytes_needed) break;
             self.selection_buffer.append(self.allocator, key_hash) catch break;
             bytes_freed += self.default_size;
@@ -2974,32 +3164,23 @@ pub const SimpleLruEviction = struct {
         return self.selection_buffer.items;
     }
 
+    /// Record access - O(1) instead of O(n)
     pub fn recordAccess(self: *Self, key_hash: u128) void {
-        for (self.access_order.items, 0..) |k, i| {
-            if (k == key_hash) {
-                _ = self.access_order.orderedRemove(i);
-                break;
-            }
-        }
-        self.access_order.append(self.allocator, key_hash) catch return;
+        self.access_order.access(key_hash);
     }
 
     pub fn recordAdd(self: *Self, key_hash: u128, size: usize) void {
         _ = size;
-        self.access_order.append(self.allocator, key_hash) catch return;
+        self.access_order.add(key_hash) catch return;
     }
 
+    /// Record removal - O(1) instead of O(n)
     pub fn recordRemove(self: *Self, key_hash: u128) void {
-        for (self.access_order.items, 0..) |k, i| {
-            if (k == key_hash) {
-                _ = self.access_order.orderedRemove(i);
-                break;
-            }
-        }
+        self.access_order.remove(key_hash);
     }
 
     pub fn save(self: *Self, allocator: Allocator) ![]u8 {
-        const count = self.access_order.items.len;
+        const count = self.access_order.count();
         const size = @sizeOf(usize) + count * @sizeOf(u128);
         const data = try allocator.alloc(u8, size);
 
@@ -3007,7 +3188,8 @@ pub const SimpleLruEviction = struct {
         @memcpy(data[offset..][0..@sizeOf(usize)], std.mem.asBytes(&count));
         offset += @sizeOf(usize);
 
-        for (self.access_order.items) |key_hash| {
+        var it = self.access_order.iterateOldestFirst();
+        while (it.next()) |key_hash| {
             @memcpy(data[offset..][0..@sizeOf(u128)], std.mem.asBytes(&key_hash));
             offset += @sizeOf(u128);
         }
@@ -3021,12 +3203,12 @@ pub const SimpleLruEviction = struct {
         const count = std.mem.bytesToValue(usize, data[0..@sizeOf(usize)]);
         var offset: usize = @sizeOf(usize);
 
-        self.access_order.clearRetainingCapacity();
+        self.access_order.clear();
 
         for (0..count) |_| {
             if (offset + @sizeOf(u128) > data.len) break;
             const key_hash = std.mem.bytesToValue(u128, data[offset..][0..@sizeOf(u128)]);
-            try self.access_order.append(self.allocator, key_hash);
+            try self.access_order.add(key_hash);
             offset += @sizeOf(u128);
         }
     }
@@ -3119,7 +3301,7 @@ test "LruEviction save/load" {
     try eviction2.load(saved);
 
     // Should have same order
-    try testing.expectEqual(eviction1.access_order.items.len, eviction2.access_order.items.len);
+    try testing.expectEqual(eviction1.access_order.count(), eviction2.access_order.count());
 }
 
 test "EvictionManager trait with LruEviction" {

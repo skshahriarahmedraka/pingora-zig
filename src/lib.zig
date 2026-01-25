@@ -15,6 +15,7 @@ pub const lru = @import("lru.zig");
 pub const tinyufo = @import("tinyufo.zig");
 pub const ketama = @import("ketama.zig");
 pub const digest = @import("digest.zig");
+pub const allocators = @import("allocators.zig");
 
 // Re-export commonly used types
 pub const Error = err.Error;
@@ -28,6 +29,12 @@ pub const LinkedList = linked_list.LinkedList;
 pub const TinyUfo = tinyufo.TinyUfo;
 pub const Continuum = ketama.Continuum;
 pub const Bucket = ketama.Bucket;
+
+// Allocator types
+pub const SlabAllocator = allocators.SlabAllocator;
+pub const RequestArena = allocators.RequestArena;
+pub const StackFallbackAllocator = allocators.StackFallbackAllocator;
+pub const PooledBuffer = allocators.PooledBuffer;
 
 // Digest types
 pub const Digest = digest.Digest;

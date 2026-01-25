@@ -19,6 +19,10 @@ const SMALL_QUEUE_PERCENTAGE: f32 = 0.1;
 pub const Weight = u16;
 pub const Key = u64;
 
+/// Cache line size for alignment (64 bytes on most modern CPUs)
+/// Using log2(64) = 6 for std.mem.Alignment enum
+const CACHE_LINE_ALIGN: std.mem.Alignment = .@"64";
+
 /// Key-value pair returned from cache eviction
 pub fn KV(comptime T: type) type {
     return struct {
@@ -158,9 +162,10 @@ fn SlabAllocator(comptime T: type) type {
 
 /// Count-Min Sketch for frequency estimation
 /// Optimized with single hash + mixing for better cache locality and fewer operations
+/// Counter rows are cache-line aligned to prevent false sharing in concurrent access
 const CountMinSketch = struct {
     allocator: Allocator,
-    counters: [][]u8,
+    counters: [][]align(64) u8,
     width: usize,
     width_mask: usize, // For fast modulo when width is power of 2
 
@@ -177,11 +182,12 @@ const CountMinSketch = struct {
         };
         const depth: usize = 4;
 
-        var counters = try allocator.alloc([]u8, depth);
+        var counters = try allocator.alloc([]align(64) u8, depth);
         errdefer allocator.free(counters);
 
         for (0..depth) |i| {
-            counters[i] = try allocator.alloc(u8, width);
+            // Allocate cache-line aligned counter rows for better performance
+            counters[i] = try allocator.alignedAlloc(u8, CACHE_LINE_ALIGN, width);
             @memset(counters[i], 0);
         }
 
@@ -202,7 +208,9 @@ const CountMinSketch = struct {
 
     /// Compute 4 hash indices from a single base hash using fast mixing
     /// This is much faster than calling Wyhash 4 times
+    /// Hash key to 4 indices - hot path, safety disabled for performance
     inline fn hashIndices(self: *const CountMinSketch, key: Key) [4]usize {
+        @setRuntimeSafety(false);
         // Single high-quality hash
         const h = std.hash.Wyhash.hash(0, std.mem.asBytes(&key));
         
@@ -218,10 +226,22 @@ const CountMinSketch = struct {
         };
     }
 
+    /// Increment key frequency - hot path, safety disabled for performance
     fn increment(self: *CountMinSketch, key: Key) u8 {
+        @setRuntimeSafety(false);
         const indices = self.hashIndices(key);
-        var min_count: u8 = 255;
         
+        // Prefetch all counter locations to hide memory latency
+        inline for (0..4) |i| {
+            const ptr: [*]const u8 = @ptrCast(&self.counters[i][indices[i]]);
+            @prefetch(ptr, .{
+                .rw = .write,
+                .locality = 3,
+                .cache = .data,
+            });
+        }
+        
+        var min_count: u8 = 255;
         inline for (0..4) |i| {
             const idx = indices[i];
             if (self.counters[i][idx] < 255) {
@@ -232,10 +252,22 @@ const CountMinSketch = struct {
         return min_count;
     }
 
+    /// Get key frequency estimate - hot path, safety disabled for performance
     fn get(self: *const CountMinSketch, key: Key) u8 {
+        @setRuntimeSafety(false);
         const indices = self.hashIndices(key);
-        var min_count: u8 = 255;
         
+        // Prefetch all counter locations to hide memory latency
+        inline for (0..4) |i| {
+            const ptr: [*]const u8 = @ptrCast(&self.counters[i][indices[i]]);
+            @prefetch(ptr, .{
+                .rw = .read,
+                .locality = 3,
+                .cache = .data,
+            });
+        }
+        
+        var min_count: u8 = 255;
         inline for (0..4) |i| {
             min_count = @min(min_count, self.counters[i][indices[i]]);
         }

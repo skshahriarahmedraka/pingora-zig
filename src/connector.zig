@@ -216,10 +216,8 @@ pub const OffloadManager = struct {
 
         // Find a valid connection (not idle too long)
         while (list.items.len > 0) {
-            // Get last item and remove it
-            const last_idx = list.items.len - 1;
-            const conn = list.items[last_idx];
-            _ = list.orderedRemove(last_idx);
+            // Get last item and remove it - O(1) using pop()
+            const conn = list.pop() orelse break;
 
             if (!conn.isIdleTooLong(self.config.offload_idle_timeout_ns)) {
                 self.stats.reused += 1;
@@ -254,7 +252,8 @@ pub const OffloadManager = struct {
         if (oldest_peer) |peer_id| {
             if (self.connections.getPtr(peer_id)) |list| {
                 if (list.items.len > 0) {
-                    const conn = list.orderedRemove(0);
+                    // Use swapRemove for O(1) - order doesn't matter for eviction
+                    const conn = list.swapRemove(0);
                     posix.close(conn.socket);
                     self.stats.idle_closed += 1;
                     self.stats.current_offloaded -= 1;
@@ -272,11 +271,13 @@ pub const OffloadManager = struct {
             var i: usize = 0;
             while (i < list.items.len) {
                 if (list.items[i].isIdleTooLong(self.config.offload_idle_timeout_ns)) {
-                    const conn = list.orderedRemove(i);
+                    // Use swapRemove for O(1) - order doesn't matter for cleanup
+                    const conn = list.swapRemove(i);
                     posix.close(conn.socket);
                     self.stats.idle_closed += 1;
                     self.stats.current_offloaded -= 1;
                     closed += 1;
+                    // Don't increment i - swapRemove moves last element to i
                 } else {
                     i += 1;
                 }

@@ -350,7 +350,9 @@ pub fn ConnectionPool(comptime K: type, comptime T: type) type {
 
         /// Put a connection back into the pool.
         /// Returns true if the connection was accepted, false if rejected (pool full or connection stale).
+        /// Hot path - safety checks disabled for performance.
         pub fn put(self: *Self, key: K, connection: T) bool {
+            @setRuntimeSafety(false);
             self.mutex.lock();
             defer self.mutex.unlock();
 
@@ -387,7 +389,9 @@ pub fn ConnectionPool(comptime K: type, comptime T: type) type {
 
         /// Get a connection from the pool for the given key.
         /// Returns the connection and its metadata, or null if none available.
+        /// Hot path - safety checks disabled for performance.
         pub fn get(self: *Self, key: K) ?struct { T, ConnectionMeta } {
+            @setRuntimeSafety(false);
             self.mutex.lock();
             defer self.mutex.unlock();
 

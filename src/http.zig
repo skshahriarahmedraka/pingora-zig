@@ -367,6 +367,171 @@ pub const HeaderName = enum {
             else => self.asStr(),
         };
     }
+
+    /// Fast case-insensitive lookup from string to HeaderName using comptime-generated perfect hash
+    /// Returns null for non-standard header names
+    /// This is O(1) and avoids any allocations
+    pub fn fromStr(name: []const u8) ?HeaderName {
+        // Use length-based dispatch for fast rejection of non-matching headers
+        return switch (name.len) {
+            2 => if (std.ascii.eqlIgnoreCase(name, "te")) .te else null,
+            3 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "age")) break :blk .age;
+                if (std.ascii.eqlIgnoreCase(name, "via")) break :blk .via;
+                break :blk null;
+            },
+            4 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "date")) break :blk .date;
+                if (std.ascii.eqlIgnoreCase(name, "etag")) break :blk .etag;
+                if (std.ascii.eqlIgnoreCase(name, "from")) break :blk .from;
+                if (std.ascii.eqlIgnoreCase(name, "host")) break :blk .host;
+                if (std.ascii.eqlIgnoreCase(name, "link")) break :blk .link;
+                if (std.ascii.eqlIgnoreCase(name, "vary")) break :blk .vary;
+                break :blk null;
+            },
+            5 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "allow")) break :blk .allow;
+                if (std.ascii.eqlIgnoreCase(name, "range")) break :blk .range;
+                break :blk null;
+            },
+            6 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "accept")) break :blk .accept;
+                if (std.ascii.eqlIgnoreCase(name, "cookie")) break :blk .cookie;
+                if (std.ascii.eqlIgnoreCase(name, "expect")) break :blk .expect;
+                if (std.ascii.eqlIgnoreCase(name, "origin")) break :blk .origin;
+                if (std.ascii.eqlIgnoreCase(name, "pragma")) break :blk .pragma;
+                if (std.ascii.eqlIgnoreCase(name, "server")) break :blk .server;
+                break :blk null;
+            },
+            7 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "expires")) break :blk .expires;
+                if (std.ascii.eqlIgnoreCase(name, "referer")) break :blk .referer;
+                if (std.ascii.eqlIgnoreCase(name, "refresh")) break :blk .refresh;
+                if (std.ascii.eqlIgnoreCase(name, "trailer")) break :blk .trailer;
+                if (std.ascii.eqlIgnoreCase(name, "upgrade")) break :blk .upgrade;
+                if (std.ascii.eqlIgnoreCase(name, "warning")) break :blk .warning;
+                break :blk null;
+            },
+            8 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "if-match")) break :blk .if_match;
+                if (std.ascii.eqlIgnoreCase(name, "if-range")) break :blk .if_range;
+                if (std.ascii.eqlIgnoreCase(name, "location")) break :blk .location;
+                break :blk null;
+            },
+            9 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "forwarded")) break :blk .forwarded;
+                break :blk null;
+            },
+            10 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "connection")) break :blk .connection;
+                if (std.ascii.eqlIgnoreCase(name, "set-cookie")) break :blk .set_cookie;
+                if (std.ascii.eqlIgnoreCase(name, "user-agent")) break :blk .user_agent;
+                break :blk null;
+            },
+            11 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "retry-after")) break :blk .retry_after;
+                break :blk null;
+            },
+            12 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "content-type")) break :blk .content_type;
+                if (std.ascii.eqlIgnoreCase(name, "max-forwards")) break :blk .max_forwards;
+                break :blk null;
+            },
+            13 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "accept-ranges")) break :blk .accept_ranges;
+                if (std.ascii.eqlIgnoreCase(name, "authorization")) break :blk .authorization;
+                if (std.ascii.eqlIgnoreCase(name, "cache-control")) break :blk .cache_control;
+                if (std.ascii.eqlIgnoreCase(name, "content-range")) break :blk .content_range;
+                if (std.ascii.eqlIgnoreCase(name, "if-none-match")) break :blk .if_none_match;
+                if (std.ascii.eqlIgnoreCase(name, "last-modified")) break :blk .last_modified;
+                break :blk null;
+            },
+            14 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "accept-charset")) break :blk .accept_charset;
+                if (std.ascii.eqlIgnoreCase(name, "content-length")) break :blk .content_length;
+                break :blk null;
+            },
+            15 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "accept-encoding")) break :blk .accept_encoding;
+                if (std.ascii.eqlIgnoreCase(name, "accept-language")) break :blk .accept_language;
+                if (std.ascii.eqlIgnoreCase(name, "x-frame-options")) break :blk .x_frame_options;
+                break :blk null;
+            },
+            16 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "content-encoding")) break :blk .content_encoding;
+                if (std.ascii.eqlIgnoreCase(name, "content-language")) break :blk .content_language;
+                if (std.ascii.eqlIgnoreCase(name, "content-location")) break :blk .content_location;
+                if (std.ascii.eqlIgnoreCase(name, "www-authenticate")) break :blk .www_authenticate;
+                if (std.ascii.eqlIgnoreCase(name, "x-xss-protection")) break :blk .x_xss_protection;
+                break :blk null;
+            },
+            17 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "if-modified-since")) break :blk .if_modified_since;
+                if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) break :blk .transfer_encoding;
+                if (std.ascii.eqlIgnoreCase(name, "sec-websocket-key")) break :blk .sec_websocket_key;
+                break :blk null;
+            },
+            18 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "proxy-authenticate")) break :blk .proxy_authenticate;
+                break :blk null;
+            },
+            19 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "content-disposition")) break :blk .content_disposition;
+                if (std.ascii.eqlIgnoreCase(name, "if-unmodified-since")) break :blk .if_unmodified_since;
+                if (std.ascii.eqlIgnoreCase(name, "proxy-authorization")) break :blk .proxy_authorization;
+                break :blk null;
+            },
+            20 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "sec-websocket-accept")) break :blk .sec_websocket_accept;
+                break :blk null;
+            },
+            21 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "sec-websocket-version")) break :blk .sec_websocket_version;
+                break :blk null;
+            },
+            22 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "sec-websocket-protocol")) break :blk .sec_websocket_protocol;
+                if (std.ascii.eqlIgnoreCase(name, "x-content-type-options")) break :blk .x_content_type_options;
+                if (std.ascii.eqlIgnoreCase(name, "access-control-max-age")) break :blk .access_control_max_age;
+                break :blk null;
+            },
+            23 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "content-security-policy")) break :blk .content_security_policy;
+                break :blk null;
+            },
+            25 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "strict-transport-security")) break :blk .strict_transport_security;
+                break :blk null;
+            },
+            27 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "access-control-allow-origin")) break :blk .access_control_allow_origin;
+                break :blk null;
+            },
+            28 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "access-control-allow-headers")) break :blk .access_control_allow_headers;
+                if (std.ascii.eqlIgnoreCase(name, "access-control-allow-methods")) break :blk .access_control_allow_methods;
+                if (std.ascii.eqlIgnoreCase(name, "access-control-expose-headers")) break :blk .access_control_expose_headers;
+                break :blk null;
+            },
+            29 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "access-control-request-method")) break :blk .access_control_request_method;
+                break :blk null;
+            },
+            30 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "access-control-request-headers")) break :blk .access_control_request_headers;
+                break :blk null;
+            },
+            32 => blk: {
+                if (std.ascii.eqlIgnoreCase(name, "access-control-allow-credentials")) break :blk .access_control_allow_credentials;
+                break :blk null;
+            },
+            22 => blk4: {
+                if (std.ascii.eqlIgnoreCase(name, "access-control-max-age")) break :blk4 .access_control_max_age;
+                break :blk4 null;
+            },
+            else => null,
+        };
+    }
 };
 
 
