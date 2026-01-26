@@ -2037,6 +2037,21 @@ pub const Connection = struct {
         }
     }
 
+    /// Get the next stream ID for server push (even numbers for server-initiated streams)
+    /// This is used by servers to initiate PUSH_PROMISE streams.
+    pub fn getNextPushStreamId(self: *Self) u31 {
+        // Server pushes use even stream IDs (2, 4, 6, ...)
+        // Client-initiated streams use odd IDs (1, 3, 5, ...)
+        if (self.is_client) {
+            // Clients don't initiate push - return 0 to indicate error
+            return 0;
+        }
+        // For servers, we use the next_stream_id which starts at 2 for servers
+        const push_id = self.next_stream_id;
+        self.next_stream_id += 2;
+        return push_id;
+    }
+
     /// Process a received frame
     pub fn processFrame(self: *Self, header: FrameHeader, payload: []const u8) !void {
         switch (header.frame_type) {
@@ -6182,4 +6197,731 @@ test "Connection priority tree cleanup on stream close" {
 
     // Verify removed
     try testing.expect(!conn.priority_tree.?.nodes.contains(stream_id));
+}
+
+// ============================================================================
+// HTTP/2 Connection Pool (for stream multiplexing)
+// ============================================================================
+
+/// Configuration for HTTP/2 connection pool
+pub const H2PoolConfig = struct {
+    /// Maximum connections per host
+    max_connections_per_host: u32 = 6,
+    /// Maximum total connections in pool
+    max_total_connections: u32 = 100,
+    /// Maximum concurrent streams per connection
+    max_streams_per_connection: u32 = DEFAULT_MAX_CONCURRENT_STREAMS,
+    /// Connection idle timeout in nanoseconds
+    idle_timeout_ns: u64 = 90 * std.time.ns_per_s,
+    /// Enable connection prewarming
+    prewarm: bool = false,
+    /// Enable push promises
+    enable_push: bool = false,
+};
+
+/// State of a pooled HTTP/2 connection
+pub const PooledConnectionState = enum {
+    /// Connection is available for new streams
+    available,
+    /// Connection is at max concurrent streams
+    busy,
+    /// Connection is being drained (GOAWAY sent/received)
+    draining,
+    /// Connection has failed
+    failed,
+    /// Connection is closed
+    closed,
+};
+
+/// A pooled HTTP/2 connection with metadata
+pub const PooledConnection = struct {
+    /// The underlying HTTP/2 connection
+    connection: *Connection,
+    /// Connection state
+    state: PooledConnectionState,
+    /// Host:port this connection is for
+    host_key: []const u8,
+    /// Number of active streams
+    active_streams: u32,
+    /// Last used timestamp (nanoseconds)
+    last_used_ns: i128,
+    /// Creation timestamp (nanoseconds)
+    created_at_ns: i128,
+    /// Whether this is a TLS connection
+    is_tls: bool,
+    /// Allocator
+    allocator: Allocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, host_key: []const u8, is_client: bool, is_tls: bool) !*Self {
+        const conn = try allocator.create(Connection);
+        conn.* = try Connection.initWithPriority(allocator, is_client);
+
+        const pooled = try allocator.create(Self);
+        pooled.* = .{
+            .connection = conn,
+            .state = .available,
+            .host_key = try allocator.dupe(u8, host_key),
+            .active_streams = 0,
+            .last_used_ns = std.time.nanoTimestamp(),
+            .created_at_ns = std.time.nanoTimestamp(),
+            .is_tls = is_tls,
+            .allocator = allocator,
+        };
+        return pooled;
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.connection.deinit();
+        self.allocator.destroy(self.connection);
+        self.allocator.free(self.host_key);
+        self.allocator.destroy(self);
+    }
+
+    /// Check if this connection can accept a new stream
+    pub fn canAcceptStream(self: *const Self, max_streams: u32) bool {
+        if (self.state != .available) return false;
+        return self.active_streams < max_streams and
+            self.active_streams < self.connection.remote_settings.max_concurrent_streams;
+    }
+
+    /// Acquire a stream from this connection
+    pub fn acquireStream(self: *Self) !*Stream {
+        const stream = try self.connection.createStream();
+        self.active_streams += 1;
+        self.last_used_ns = std.time.nanoTimestamp();
+
+        // Check if we've reached max streams
+        if (self.active_streams >= self.connection.remote_settings.max_concurrent_streams) {
+            self.state = .busy;
+        }
+
+        return stream;
+    }
+
+    /// Release a stream back to the pool
+    pub fn releaseStream(self: *Self, stream_id: u31) void {
+        if (self.connection.streams.contains(stream_id)) {
+            _ = self.connection.streams.remove(stream_id);
+        }
+
+        if (self.active_streams > 0) {
+            self.active_streams -= 1;
+        }
+
+        self.last_used_ns = std.time.nanoTimestamp();
+
+        // Update state
+        if (self.state == .busy and self.active_streams < self.connection.remote_settings.max_concurrent_streams) {
+            self.state = .available;
+        }
+    }
+
+    /// Mark connection as draining (GOAWAY received)
+    pub fn drain(self: *Self) void {
+        self.state = .draining;
+    }
+
+    /// Check if connection is idle (no active streams)
+    pub fn isIdle(self: *const Self) bool {
+        return self.active_streams == 0;
+    }
+
+    /// Check if connection has timed out
+    pub fn hasTimedOut(self: *const Self, timeout_ns: u64) bool {
+        if (!self.isIdle()) return false;
+        const now = std.time.nanoTimestamp();
+        const idle_duration = now - self.last_used_ns;
+        return idle_duration > @as(i128, timeout_ns);
+    }
+};
+
+/// HTTP/2 Connection Pool for multiplexing streams across connections
+pub const H2ConnectionPool = struct {
+    /// Connections indexed by host key
+    connections: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(*PooledConnection)),
+    /// Pool configuration
+    config: H2PoolConfig,
+    /// Total connections in pool
+    total_connections: u32,
+    /// Statistics
+    stats: PoolStats,
+    /// Allocator
+    allocator: Allocator,
+    /// Mutex for thread safety
+    mutex: std.Thread.Mutex,
+
+    const Self = @This();
+
+    /// Pool statistics
+    pub const PoolStats = struct {
+        /// Total streams created
+        streams_created: u64 = 0,
+        /// Total connections created
+        connections_created: u64 = 0,
+        /// Connections reused (stream multiplexed on existing connection)
+        connections_reused: u64 = 0,
+        /// Connections closed due to timeout
+        connections_timed_out: u64 = 0,
+        /// Connections closed due to GOAWAY
+        connections_goaway: u64 = 0,
+        /// Connection errors
+        connection_errors: u64 = 0,
+    };
+
+    pub fn init(allocator: Allocator, config: H2PoolConfig) Self {
+        return .{
+            .connections = .{},
+            .config = config,
+            .total_connections = 0,
+            .stats = .{},
+            .allocator = allocator,
+            .mutex = .{},
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        var it = self.connections.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items) |conn| {
+                conn.deinit();
+            }
+            entry.value_ptr.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.connections.deinit(self.allocator);
+    }
+
+    /// Get or create a connection for the given host
+    pub fn getConnection(self: *Self, host: []const u8, port: u16, is_tls: bool) !*PooledConnection {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Build host key
+        var key_buf: [512]u8 = undefined;
+        const key_len = std.fmt.bufPrint(&key_buf, "{s}:{d}:{s}", .{
+            host,
+            port,
+            if (is_tls) "tls" else "plain",
+        }) catch return error.HostKeyTooLong;
+        const host_key = key_buf[0..key_len.len];
+
+        // Try to find an existing connection with capacity
+        if (self.connections.get(host_key)) |*conn_list| {
+            for (conn_list.items) |conn| {
+                if (conn.canAcceptStream(self.config.max_streams_per_connection)) {
+                    self.stats.connections_reused += 1;
+                    return conn;
+                }
+            }
+        }
+
+        // Need to create a new connection
+        if (self.total_connections >= self.config.max_total_connections) {
+            // Try to evict an idle connection
+            if (!self.evictIdleConnection()) {
+                return error.PoolExhausted;
+            }
+        }
+
+        // Check per-host limit
+        const current_host_connections = if (self.connections.get(host_key)) |list| list.items.len else 0;
+        if (current_host_connections >= self.config.max_connections_per_host) {
+            return error.HostConnectionLimitReached;
+        }
+
+        // Create new connection
+        const new_conn = try PooledConnection.init(self.allocator, host_key, true, is_tls);
+        errdefer new_conn.deinit();
+
+        // Add to pool
+        const result = self.connections.getOrPut(self.allocator, host_key) catch |err| {
+            new_conn.deinit();
+            return err;
+        };
+
+        if (!result.found_existing) {
+            result.key_ptr.* = try self.allocator.dupe(u8, host_key);
+            result.value_ptr.* = .{};
+        }
+
+        try result.value_ptr.append(self.allocator, new_conn);
+        self.total_connections += 1;
+        self.stats.connections_created += 1;
+
+        return new_conn;
+    }
+
+    /// Acquire a stream from the pool for the given host
+    pub fn acquireStream(self: *Self, host: []const u8, port: u16, is_tls: bool) !StreamHandle {
+        const conn = try self.getConnection(host, port, is_tls);
+        const stream = try conn.acquireStream();
+
+        self.mutex.lock();
+        self.stats.streams_created += 1;
+        self.mutex.unlock();
+
+        return .{
+            .stream = stream,
+            .connection = conn,
+            .pool = self,
+        };
+    }
+
+    /// Release a stream back to the pool
+    pub fn releaseStream(self: *Self, handle: *StreamHandle) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        handle.connection.releaseStream(handle.stream.id);
+    }
+
+    /// Handle GOAWAY received on a connection
+    pub fn handleGoaway(self: *Self, conn: *PooledConnection) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        conn.drain();
+        self.stats.connections_goaway += 1;
+    }
+
+    /// Evict an idle connection (returns true if one was evicted)
+    fn evictIdleConnection(self: *Self) bool {
+        var oldest_idle: ?*PooledConnection = null;
+        var oldest_time: i128 = std.math.maxInt(i128);
+        var oldest_key: ?[]const u8 = null;
+
+        var it = self.connections.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items) |conn| {
+                if (conn.isIdle() and conn.last_used_ns < oldest_time) {
+                    oldest_idle = conn;
+                    oldest_time = conn.last_used_ns;
+                    oldest_key = entry.key_ptr.*;
+                }
+            }
+        }
+
+        if (oldest_idle) |conn| {
+            self.removeConnection(oldest_key.?, conn);
+            self.stats.connections_timed_out += 1;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// Remove a connection from the pool
+    fn removeConnection(self: *Self, host_key: []const u8, conn: *PooledConnection) void {
+        if (self.connections.getPtr(host_key)) |list| {
+            for (list.items, 0..) |c, i| {
+                if (c == conn) {
+                    _ = list.swapRemove(i);
+                    break;
+                }
+            }
+        }
+
+        conn.deinit();
+        self.total_connections -= 1;
+    }
+
+    /// Cleanup timed out connections
+    pub fn cleanup(self: *Self) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var to_remove = std.ArrayListUnmanaged(struct { key: []const u8, conn: *PooledConnection }){};
+        defer to_remove.deinit(self.allocator);
+
+        var it = self.connections.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items) |conn| {
+                if (conn.hasTimedOut(self.config.idle_timeout_ns) or conn.state == .closed or conn.state == .failed) {
+                    to_remove.append(self.allocator, .{ .key = entry.key_ptr.*, .conn = conn }) catch continue;
+                }
+            }
+        }
+
+        for (to_remove.items) |item| {
+            self.removeConnection(item.key, item.conn);
+            self.stats.connections_timed_out += 1;
+        }
+    }
+
+    /// Get pool statistics
+    pub fn getStats(self: *Self) PoolStats {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.stats;
+    }
+
+    /// Get current pool size
+    pub fn size(self: *Self) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.total_connections;
+    }
+};
+
+/// Handle to a stream acquired from the pool
+pub const StreamHandle = struct {
+    /// The stream
+    stream: *Stream,
+    /// The connection this stream belongs to
+    connection: *PooledConnection,
+    /// The pool
+    pool: *H2ConnectionPool,
+
+    /// Release this stream back to the pool
+    pub fn release(self: *StreamHandle) void {
+        self.pool.releaseStream(self);
+    }
+
+    /// Get the underlying connection
+    pub fn getConnection(self: *StreamHandle) *Connection {
+        return self.connection.connection;
+    }
+};
+
+// ============================================================================
+// HTTP/2 Server Push (RFC 7540 Section 8.2)
+// ============================================================================
+
+/// Server push promise
+pub const PushPromise = struct {
+    /// The promised stream ID
+    promised_stream_id: u31,
+    /// The associated request stream ID
+    associated_stream_id: u31,
+    /// Promised request headers (pseudo-headers + regular headers)
+    headers: std.ArrayListUnmanaged(HeaderField),
+    /// State of the push promise
+    state: PushState,
+    /// Allocator
+    allocator: Allocator,
+
+    const Self = @This();
+
+    pub const PushState = enum {
+        /// Promise sent/received, waiting for response
+        pending,
+        /// Response headers received
+        active,
+        /// Push was cancelled
+        cancelled,
+        /// Push completed
+        completed,
+    };
+
+    pub fn init(allocator: Allocator, promised_id: u31, associated_id: u31) Self {
+        return .{
+            .promised_stream_id = promised_id,
+            .headers = .{},
+            .associated_stream_id = associated_id,
+            .state = .pending,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.headers.deinit(self.allocator);
+    }
+
+    /// Add a header to the push promise
+    pub fn addHeader(self: *Self, name: []const u8, value: []const u8) !void {
+        try self.headers.append(self.allocator, .{ .name = name, .value = value });
+    }
+
+    /// Get the :method pseudo-header
+    pub fn getMethod(self: *const Self) ?[]const u8 {
+        for (self.headers.items) |h| {
+            if (std.mem.eql(u8, h.name, ":method")) return h.value;
+        }
+        return null;
+    }
+
+    /// Get the :path pseudo-header
+    pub fn getPath(self: *const Self) ?[]const u8 {
+        for (self.headers.items) |h| {
+            if (std.mem.eql(u8, h.name, ":path")) return h.value;
+        }
+        return null;
+    }
+
+    /// Get the :authority pseudo-header
+    pub fn getAuthority(self: *const Self) ?[]const u8 {
+        for (self.headers.items) |h| {
+            if (std.mem.eql(u8, h.name, ":authority")) return h.value;
+        }
+        return null;
+    }
+};
+
+/// Server push handler for managing push promises
+pub const ServerPushHandler = struct {
+    /// Pending push promises by promised stream ID
+    promises: std.AutoHashMapUnmanaged(u31, *PushPromise),
+    /// Maximum concurrent pushes
+    max_concurrent_pushes: u32,
+    /// Current active pushes
+    active_pushes: u32,
+    /// Whether push is enabled
+    enabled: bool,
+    /// Allocator
+    allocator: Allocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, enabled: bool) Self {
+        return .{
+            .promises = .{},
+            .max_concurrent_pushes = DEFAULT_MAX_CONCURRENT_STREAMS,
+            .enabled = enabled,
+            .active_pushes = 0,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        var it = self.promises.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.deinit();
+            self.allocator.destroy(entry.value_ptr.*);
+        }
+        self.promises.deinit(self.allocator);
+    }
+
+    /// Create a new push promise (server side)
+    pub fn createPushPromise(
+        self: *Self,
+        conn: *Connection,
+        associated_stream_id: u31,
+        method: []const u8,
+        path: []const u8,
+        authority: []const u8,
+    ) !*PushPromise {
+        if (!self.enabled) return error.PushDisabled;
+        if (self.active_pushes >= self.max_concurrent_pushes) return error.TooManyPushes;
+
+        // Server pushes use even stream IDs (but since client uses odd, server uses next even)
+        const promised_id = conn.getNextPushStreamId();
+
+        const promise = try self.allocator.create(PushPromise);
+        promise.* = PushPromise.init(self.allocator, promised_id, associated_stream_id);
+        errdefer {
+            promise.deinit();
+            self.allocator.destroy(promise);
+        }
+
+        // Add required pseudo-headers
+        try promise.addHeader(":method", method);
+        try promise.addHeader(":path", path);
+        try promise.addHeader(":scheme", "https");
+        try promise.addHeader(":authority", authority);
+
+        try self.promises.put(self.allocator, promised_id, promise);
+        self.active_pushes += 1;
+
+        return promise;
+    }
+
+    /// Handle receiving a PUSH_PROMISE frame (client side)
+    pub fn handlePushPromise(
+        self: *Self,
+        promised_stream_id: u31,
+        associated_stream_id: u31,
+        headers: []const HeaderField,
+    ) !*PushPromise {
+        if (!self.enabled) {
+            return error.PushDisabled;
+        }
+
+        const promise = try self.allocator.create(PushPromise);
+        promise.* = PushPromise.init(self.allocator, promised_stream_id, associated_stream_id);
+        errdefer {
+            promise.deinit();
+            self.allocator.destroy(promise);
+        }
+
+        for (headers) |h| {
+            try promise.addHeader(h.name, h.value);
+        }
+
+        try self.promises.put(self.allocator, promised_stream_id, promise);
+        self.active_pushes += 1;
+
+        return promise;
+    }
+
+    /// Cancel a push promise
+    pub fn cancelPush(self: *Self, promised_stream_id: u31) void {
+        if (self.promises.get(promised_stream_id)) |promise| {
+            promise.state = .cancelled;
+            if (self.active_pushes > 0) {
+                self.active_pushes -= 1;
+            }
+        }
+    }
+
+    /// Complete a push
+    pub fn completePush(self: *Self, promised_stream_id: u31) void {
+        if (self.promises.get(promised_stream_id)) |promise| {
+            promise.state = .completed;
+            if (self.active_pushes > 0) {
+                self.active_pushes -= 1;
+            }
+        }
+    }
+
+    /// Get a push promise by ID
+    pub fn getPromise(self: *Self, promised_stream_id: u31) ?*PushPromise {
+        return self.promises.get(promised_stream_id);
+    }
+
+    /// Build a PUSH_PROMISE frame
+    pub fn buildPushPromiseFrame(
+        self: *Self,
+        encoder: *HpackEncoder,
+        promise: *const PushPromise,
+        buf: []u8,
+    ) !usize {
+        _ = self;
+
+        if (buf.len < FRAME_HEADER_SIZE + 4) return error.BufferTooSmall;
+
+        var offset: usize = FRAME_HEADER_SIZE;
+
+        // Write promised stream ID (4 bytes)
+        const promised_id: u32 = promise.promised_stream_id;
+        buf[offset] = @truncate((promised_id >> 24) & 0x7F); // Clear reserved bit
+        buf[offset + 1] = @truncate(promised_id >> 16);
+        buf[offset + 2] = @truncate(promised_id >> 8);
+        buf[offset + 3] = @truncate(promised_id);
+        offset += 4;
+
+        // Encode headers
+        for (promise.headers.items) |header| {
+            const header_size = try encoder.encodeHeader(header.name, header.value, buf[offset..]);
+            offset += header_size;
+        }
+
+        // Write frame header
+        const payload_len: u24 = @intCast(offset - FRAME_HEADER_SIZE);
+        const header = FrameHeader{
+            .length = payload_len,
+            .frame_type = .push_promise,
+            .flags = FrameFlags.END_HEADERS,
+            .stream_id = promise.associated_stream_id,
+        };
+        header.serialize(buf[0..FRAME_HEADER_SIZE]);
+
+        return offset;
+    }
+
+    /// Check if there are pending pushes for a stream
+    pub fn hasPendingPushes(self: *Self, associated_stream_id: u31) bool {
+        var it = self.promises.iterator();
+        while (it.next()) |entry| {
+            const promise = entry.value_ptr.*;
+            if (promise.associated_stream_id == associated_stream_id and
+                promise.state == .pending)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+// ============================================================================
+// Connection Pool Tests
+// ============================================================================
+
+test "H2ConnectionPool basic operations" {
+    var pool = H2ConnectionPool.init(testing.allocator, .{});
+    defer pool.deinit();
+
+    // Get a connection
+    const conn = try pool.getConnection("example.com", 443, true);
+    try testing.expect(conn.state == .available);
+    try testing.expect(conn.is_tls);
+    try testing.expectEqual(pool.size(), 1);
+
+    // Get same host should return same connection (reuse)
+    const conn2 = try pool.getConnection("example.com", 443, true);
+    try testing.expect(conn == conn2);
+
+    const stats = pool.getStats();
+    try testing.expectEqual(stats.connections_created, 1);
+    try testing.expectEqual(stats.connections_reused, 1);
+}
+
+test "H2ConnectionPool different hosts" {
+    var pool = H2ConnectionPool.init(testing.allocator, .{});
+    defer pool.deinit();
+
+    const conn1 = try pool.getConnection("host1.com", 443, true);
+    const conn2 = try pool.getConnection("host2.com", 443, true);
+
+    try testing.expect(conn1 != conn2);
+    try testing.expectEqual(pool.size(), 2);
+}
+
+test "PooledConnection stream lifecycle" {
+    const conn = try PooledConnection.init(testing.allocator, "test:443:tls", true, true);
+    defer conn.deinit();
+
+    try testing.expect(conn.isIdle());
+    try testing.expect(conn.canAcceptStream(100));
+
+    const stream = try conn.acquireStream();
+    try testing.expectEqual(conn.active_streams, 1);
+    try testing.expect(!conn.isIdle());
+
+    conn.releaseStream(stream.id);
+    try testing.expectEqual(conn.active_streams, 0);
+    try testing.expect(conn.isIdle());
+}
+
+test "ServerPushHandler create and cancel push" {
+    var handler = ServerPushHandler.init(testing.allocator, true);
+    defer handler.deinit();
+
+    var conn = Connection.initServer(testing.allocator); // Server
+    defer conn.deinit();
+
+    const promise = try handler.createPushPromise(&conn, 1, "GET", "/style.css", "example.com");
+    try testing.expectEqual(promise.state, .pending);
+    try testing.expectEqualStrings("GET", promise.getMethod().?);
+    try testing.expectEqualStrings("/style.css", promise.getPath().?);
+
+    handler.cancelPush(promise.promised_stream_id);
+    try testing.expectEqual(promise.state, .cancelled);
+}
+
+test "ServerPushHandler disabled" {
+    var handler = ServerPushHandler.init(testing.allocator, false);
+    defer handler.deinit();
+
+    var conn = Connection.initServer(testing.allocator);
+    defer conn.deinit();
+
+    const result = handler.createPushPromise(&conn, 1, "GET", "/", "example.com");
+    try testing.expectError(error.PushDisabled, result);
+}
+
+test "PushPromise headers" {
+    var promise = PushPromise.init(testing.allocator, 2, 1);
+    defer promise.deinit();
+
+    try promise.addHeader(":method", "GET");
+    try promise.addHeader(":path", "/resource");
+    try promise.addHeader(":authority", "example.com");
+    try promise.addHeader(":scheme", "https");
+
+    try testing.expectEqualStrings("GET", promise.getMethod().?);
+    try testing.expectEqualStrings("/resource", promise.getPath().?);
+    try testing.expectEqualStrings("example.com", promise.getAuthority().?);
 }
