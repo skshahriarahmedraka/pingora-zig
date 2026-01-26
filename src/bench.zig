@@ -562,9 +562,9 @@ fn benchmarkConnectionPool(allocator: Allocator) !void {
         recordResult("pool", "create_pool", elapsed, 10000);
     }
 
-    // Benchmark put operations
+    // Benchmark put operations (large capacity to avoid eviction overhead)
     {
-        var p = ConnectionPool.init(allocator, 10000);
+        var p = ConnectionPool.init(allocator, BENCH_ITERATIONS + 1000);
         defer p.deinit();
 
         var timer = try Timer.start();

@@ -172,7 +172,7 @@ pub fn PoolNode(comptime T: type) type {
 /// - O(1) remove by ID
 /// - O(1) pop from tail (eviction)
 const EvictionTracker = struct {
-    /// Map from connection ID to group key and list position
+    /// Map from connection ID to group key, list position, AND index within the group's list
     entries: std.AutoHashMapUnmanaged(u64, Entry),
     /// Head of the LRU list (most recently used)
     head: ?u64,
@@ -365,7 +365,8 @@ pub fn ConnectionPool(comptime K: type, comptime T: type) type {
             }
 
             const hashed_key = hashKey(key);
-            const timestamp = CachedTimestamp.refresh();
+            // Use cached timestamp instead of refresh() to avoid syscall on every put
+            const timestamp = CachedTimestamp.now();
             const id = self.next_id;
             self.next_id += 1;
 
@@ -464,16 +465,35 @@ pub fn ConnectionPool(comptime K: type, comptime T: type) type {
         }
 
         /// Evict one connection using LRU (most efficient)
+        /// Hot path - safety checks disabled for performance
         fn evictOneLru(self: *Self) bool {
+            @setRuntimeSafety(false);
             // Pop the least recently used connection ID
             if (self.eviction_tracker.popLru()) |evicted| {
                 // Find and remove from the appropriate pool
                 if (self.pools.getPtr(evicted.group_key)) |list| {
-                    for (list.items, 0..) |*node, i| {
-                        if (node.meta.id == evicted.id) {
-                            _ = list.swapRemove(i);
+                    // Fast path: if only one item or the target is at the end, O(1)
+                    if (list.items.len > 0) {
+                        const last_idx = list.items.len - 1;
+                        // Check if the LRU item is at the end (common case after LIFO access)
+                        if (list.items[last_idx].meta.id == evicted.id) {
+                            _ = list.swapRemove(last_idx);
                             self.total_count -|= 1;
                             return true;
+                        }
+                        // Check if at the beginning
+                        if (list.items[0].meta.id == evicted.id) {
+                            _ = list.swapRemove(0);
+                            self.total_count -|= 1;
+                            return true;
+                        }
+                        // Fallback: O(n) search (should be rare)
+                        for (list.items, 0..) |*node, i| {
+                            if (node.meta.id == evicted.id) {
+                                _ = list.swapRemove(i);
+                                self.total_count -|= 1;
+                                return true;
+                            }
                         }
                     }
                 }
