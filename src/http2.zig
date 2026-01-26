@@ -6302,9 +6302,8 @@ pub const PooledConnection = struct {
 
     /// Release a stream back to the pool
     pub fn releaseStream(self: *Self, stream_id: u31) void {
-        if (self.connection.streams.contains(stream_id)) {
-            _ = self.connection.streams.remove(stream_id);
-        }
+        // Properly free the stream using Connection.removeStream which handles cleanup
+        self.connection.removeStream(stream_id);
 
         if (self.active_streams > 0) {
             self.active_streams -= 1;
